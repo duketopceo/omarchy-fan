@@ -398,33 +398,20 @@ Panel {
         width: parent.width
         spacing: Style.space(8)
         Repeater {
-          model: [
-            {
-              "id": "low",
-              "label": "Low"
-            },
-            {
-              "id": "med",
-              "label": "Med"
-            },
-            {
-              "id": "high",
-              "label": "High"
-            }
-          ]
+          model: ["low", "med", "high"]
           delegate: Rectangle {
-            required property var modelData
+            required property string modelData
             width: (parent.width - Style.space(16)) / 3
             height: Style.space(36)
             radius: Style.space(6)
             opacity: root.fanControl ? 1 : 0.4
-            color: root.currentMode === modelData.id ? root.fg : "transparent"
+            color: root.currentMode === modelData ? root.fg : "transparent"
             border.color: root.fg
             border.width: 1
             Text {
               anchors.centerIn: parent
-              text: modelData.label
-              color: root.currentMode === modelData.id ? Color.background : root.fg
+              text: modelData === "low" ? "Low" : (modelData === "med" ? "Med" : "High")
+              color: root.currentMode === modelData ? Color.background : root.fg
               font.bold: true
               font.pixelSize: Style.font.bodySmall
             }
@@ -432,7 +419,7 @@ Panel {
               anchors.fill: parent
               enabled: root.fanControl
               cursorShape: Qt.PointingHandCursor
-              onClicked: root.setMode(modelData.id)
+              onClicked: root.setMode(modelData)
             }
           }
         }
