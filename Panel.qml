@@ -31,7 +31,7 @@ Panel {
   property int selectedProc: 0
 
   readonly property color fg: bar ? bar.foreground : Color.foreground
-  readonly property color urgent: bar ? bar.urgent : Color.urgent
+  readonly property color urgent: Color.urgent
   readonly property color accent: Color.accent
   readonly property color muted: Color.muted
   readonly property color surface: Color.popups.background
@@ -163,7 +163,7 @@ Panel {
     text: "󰍛 " + root.memUsed + "G " + root.memPct + "%  " + root.cpuTemp + "  " + (root.currentMode === "high" ? "H" : (root.currentMode === "med" ? "M" : "L"))
     fontSize: Style.font.bodySmall
     active: root.memPct >= 80 || root.currentMode === "high"
-    activeColor: root.memPct >= 85 ? root.urgent : (root.bar ? root.bar.urgent : Color.urgent)
+    activeColor: root.memPct >= 85 ? root.urgent : (root.bar ? root.bar.barForeground : Color.foreground)
     tooltipText: "RAM " + root.memUsed + "/" + root.memTotal + "G · CPU " + root.cpuLoad + "% " + root.cpuTemp + " · GPU " + root.gpuTemp + " · SSD " + root.nvmeTemp + (root.fanControl ? " · right-click cycles fan" : " · fan control unavailable")
     horizontalMargin: 6.0
     onPressed: function (buttonCode) {
