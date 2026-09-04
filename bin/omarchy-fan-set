@@ -1,4 +1,62 @@
-#!/bin/bash
-MODE="${1:-auto}"
-printf "%s" "$MODE" > /tmp/current_fan_mode
-chmod 666 /tmp/current_fan_mode 2>/dev/null || true
+#!/usr/bin/env python3
+"""Write the requested Omarchy fan mode and optional custom curve."""
+
+import json
+import os
+import sys
+from pathlib import Path
+
+PRESETS = {
+    "silent": [[0, 0], [30, 50], [40, 80], [50, 115], [60, 150], [70, 195], [80, 255]],
+    "balanced": [[0, 0], [30, 80], [40, 120], [50, 160], [60, 200], [70, 240], [80, 255]],
+    "performance": [[0, 0], [25, 100], [35, 160], [45, 210], [55, 255]],
+}
+
+
+def write_mode(mode: str) -> None:
+    path = Path("/tmp/current_fan_mode")
+    path.write_text(mode)
+    try:
+        os.chmod(path, 0o666)
+    except OSError:
+        pass
+
+
+def write_curve(points: list[list[int]]) -> None:
+    home = Path.home()
+    path = home / ".config" / "omarchy" / "fan_curve.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "w") as fh:
+        json.dump(points, fh)
+
+
+def main(argv: list[str]) -> None:
+    if not argv:
+        write_mode("auto")
+        return
+
+    first = argv[0].lower()
+
+    if first == "custom":
+        name = argv[1].lower() if len(argv) > 1 else ""
+        if name in PRESETS:
+            write_curve(PRESETS[name])
+        write_mode("custom")
+        return
+
+    if first in {"auto", "low", "med", "high"}:
+        write_mode(first)
+        return
+
+    # Allow e.g. "silent" to mean "custom + silent curve"
+    if first in PRESETS:
+        write_curve(PRESETS[first])
+        write_mode("custom")
+        return
+
+    write_mode("auto")
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])

@@ -11,7 +11,10 @@ Panel {
   ipcTarget: "lukedaduke.fan"
 
   property string currentMode: "auto"
+  property string customName: "balanced"
   property int cpuLoad: 0
+  property string cpuName: "CPU"
+  property var cpuCores: []
   property int memPct: 0
   property string memUsed: "--"
   property string memAvail: "--"
@@ -19,12 +22,17 @@ Panel {
   property string swapUsed: "--"
   property string swapTotal: "--"
   property int swapPct: 0
+  property string ramInfo: ""
   property string cpuTemp: "--"
+  property string gpuName: "GPU"
+  property int gpuLoad: -1
   property string gpuTemp: "--"
   property string nvmeTemp: "--"
   property int fan1Rpm: 0
   property int fan2Rpm: 0
   property var topMem: []
+  property var disks: []
+  property var fanCurve: []
   property bool isRefreshing: false
   property string fetchError: ""
   property bool fanControl: false
@@ -48,7 +56,16 @@ Panel {
     if (!mode || !root.fanControl)
       return
     currentMode = mode
-    Quickshell.execDetached(["omarchy-fan-set", mode])
+    Quickshell.execDetached(["python3", root.pluginRoot + "/bin/omarchy-fan-set", mode])
+    refreshTimer.restart()
+  }
+
+  function setCustom(name) {
+    if (!root.fanControl)
+      return
+    currentMode = "custom"
+    customName = name
+    Quickshell.execDetached(["python3", root.pluginRoot + "/bin/omarchy-fan-set", "custom", name])
     refreshTimer.restart()
   }
 
@@ -61,6 +78,8 @@ Panel {
       setMode("med")
     else if (currentMode === "med")
       setMode("high")
+    else if (currentMode === "high")
+      setMode("custom")
     else
       setMode("auto")
   }
@@ -79,10 +98,37 @@ Panel {
     }
   }
 
+  function btop() {
+    if (bar)
+      bar.run("omarchy-launch-or-focus-tui btop")
+    root.close()
+  }
+
   function memColor() {
     if (root.memPct >= 85)
       return root.urgent
     if (root.memPct >= 70)
+      return root.accent
+    return root.fg
+  }
+
+  function tempColor(tempStr) {
+    var t = parseInt(tempStr)
+    if (isNaN(t))
+      return root.muted
+    if (t >= 85)
+      return root.urgent
+    if (t >= 65)
+      return root.accent
+    return root.fg
+  }
+
+  function levelColor(value, warn, crit) {
+    if (value < 0 || isNaN(value))
+      return root.muted
+    if (value >= crit)
+      return root.urgent
+    if (value >= warn)
       return root.accent
     return root.fg
   }
@@ -111,8 +157,12 @@ Panel {
           root.fetchError = ""
           if (data.fan_mode)
             root.currentMode = String(data.fan_mode).trim()
+          if (data.cpu_name)
+            root.cpuName = String(data.cpu_name)
           if (data.cpu_load !== undefined)
             root.cpuLoad = Math.max(0, Math.min(100, parseInt(data.cpu_load) || 0))
+          if (Array.isArray(data.cpu_cores))
+            root.cpuCores = data.cpu_cores
           if (data.mem_pct !== undefined)
             root.memPct = Math.max(0, Math.min(100, parseInt(data.mem_pct) || 0))
           if (data.mem_used)
@@ -127,8 +177,16 @@ Panel {
             root.swapTotal = String(data.swap_total)
           if (data.swap_pct !== undefined)
             root.swapPct = Math.max(0, Math.min(100, parseInt(data.swap_pct) || 0))
+          if (data.ram_info)
+            root.ramInfo = String(data.ram_info)
           if (data.cpu_temp)
             root.cpuTemp = String(data.cpu_temp)
+          if (data.gpu_name)
+            root.gpuName = String(data.gpu_name)
+          if (data.gpu_load !== undefined) {
+            var gl = parseInt(data.gpu_load)
+            root.gpuLoad = isNaN(gl) ? -1 : Math.max(0, Math.min(100, gl))
+          }
           if (data.gpu_temp)
             root.gpuTemp = String(data.gpu_temp)
           if (data.nvme_temp)
@@ -139,6 +197,10 @@ Panel {
             root.fan2Rpm = parseInt(data.fan2_rpm) || 0
           if (Array.isArray(data.top_mem))
             root.topMem = data.top_mem
+          if (Array.isArray(data.disks))
+            root.disks = data.disks
+          if (Array.isArray(data.fan_curve))
+            root.fanCurve = data.fan_curve
           root.fanControl = !!data.fan_control
           if (root.selectedProc >= root.topMem.length)
             root.selectedProc = Math.max(0, root.topMem.length - 1)
@@ -162,15 +224,17 @@ Panel {
     id: button
     anchors.fill: parent
     bar: root.bar
-    text: "󰍛 " + root.memUsed + "G " + root.memPct + "%  " + root.cpuTemp + "  " + (root.currentMode === "auto" ? "A" : (root.currentMode === "high" ? "H" : (root.currentMode === "med" ? "M" : "L")))
+    text: "󰍛 " + root.memUsed + "G " + root.memPct + "%  " + root.cpuTemp + "  " + (root.currentMode === "auto" ? "A" : (root.currentMode === "high" ? "H" : (root.currentMode === "med" ? "M" : (root.currentMode === "custom" ? "C" : "L"))))
     fontSize: Style.font.bodySmall
     active: root.memPct >= 80 || root.currentMode === "high" || (root.currentMode === "auto" && parseInt(root.cpuTemp) >= 60)
     activeColor: root.memPct >= 85 || parseInt(root.cpuTemp) >= 65 ? root.urgent : (root.bar ? root.bar.urgent : Color.urgent)
-    tooltipText: "RAM " + root.memUsed + "/" + root.memTotal + "G · CPU " + root.cpuLoad + "% " + root.cpuTemp + " · GPU " + root.gpuTemp + " · SSD " + root.nvmeTemp + (root.fanControl ? " · right-click cycles fan" : " · fan control unavailable")
+    tooltipText: "RAM " + root.memUsed + "/" + root.memTotal + "G · CPU " + root.cpuLoad + "% " + root.cpuTemp + " · GPU " + root.gpuTemp + " · SSD " + root.nvmeTemp + (root.fanControl ? " · right-click cycles fan · middle btop" : " · fan control unavailable")
     horizontalMargin: 6.0
     onPressed: function (buttonCode) {
       if (buttonCode === Qt.RightButton)
         root.cycleMode()
+      else if (buttonCode === Qt.MiddleButton)
+        root.btop()
       else {
         root.refresh()
         root.toggle()
@@ -184,7 +248,7 @@ Panel {
     owner: root
     bar: root.bar
     open: root.opened
-    contentWidth: panel.fittedContentWidth(Style.space(380))
+    contentWidth: panel.fittedContentWidth(Style.space(420))
     contentHeight: panel.fittedContentHeight(mainColumn.implicitHeight)
     Keys.onPressed: function (event) {
       if (event.key === Qt.Key_J) {
@@ -196,13 +260,16 @@ Panel {
       } else if (event.key === Qt.Key_X && root.topMem[root.selectedProc]) {
         root.killProcess(root.topMem[root.selectedProc].pid)
         event.accepted = true
+      } else if (event.key === Qt.Key_B) {
+        root.btop()
+        event.accepted = true
       }
     }
 
     Column {
       id: mainColumn
       width: parent.width
-      spacing: Style.space(10)
+      spacing: Style.space(12)
       padding: Style.space(14)
 
       RowLayout {
@@ -228,11 +295,12 @@ Panel {
           width: modeLabel.implicitWidth + 14
           height: 22
           radius: 11
-          color: root.currentMode === "high" ? root.urgent : (root.currentMode === "med" ? root.accent : root.muted)
+          color: root.currentMode === "high" || (root.currentMode === "custom" && root.customName === "performance") ? root.urgent :
+                 (root.currentMode === "med" || (root.currentMode === "custom" && root.customName === "balanced") ? root.accent : root.muted)
           Text {
             id: modeLabel
             anchors.centerIn: parent
-            text: root.fanControl ? root.currentMode.toUpperCase() : "READ"
+            text: root.fanControl ? (root.currentMode === "custom" ? root.customName.toUpperCase() : root.currentMode.toUpperCase()) : "READ"
             color: Color.background
             font.pixelSize: Style.font.bodySmall
             font.bold: true
@@ -246,17 +314,107 @@ Panel {
         }
       }
 
-      Rectangle {
-        width: parent.width
-        height: 1
-        color: root.fg
-        opacity: 0.12
-      }
+      PanelSeparator { foreground: root.fg }
 
       Column {
         width: parent.width
         spacing: Style.space(6)
+        Text {
+          text: root.cpuName
+          color: root.fg
+          font.family: root.bar ? root.bar.fontFamily : Style.font.family
+          font.pixelSize: Style.font.bodySmall
+          font.bold: true
+        }
+        RowLayout {
+          width: parent.width
+          Text {
+            text: "CPU " + root.cpuLoad + "%"
+            color: root.levelColor(root.cpuLoad, 70, 90)
+            font.family: root.bar ? root.bar.fontFamily : Style.font.family
+            font.pixelSize: Style.font.bodySmall
+            font.bold: true
+          }
+          Item {
+            Layout.fillWidth: true
+          }
+          Text {
+            text: root.cpuTemp
+            color: root.tempColor(root.cpuTemp)
+            font.family: root.bar ? root.bar.fontFamily : Style.font.family
+            font.pixelSize: Style.font.bodySmall
+            font.bold: true
+          }
+        }
+        Rectangle {
+          width: parent.width
+          height: Style.space(7)
+          radius: 3.5
+          color: root.fg
+          opacity: 0.15
+          Rectangle {
+            width: Math.max(4, parent.width * (root.cpuLoad / 100.0))
+            height: parent.height
+            radius: 3.5
+            color: root.levelColor(root.cpuLoad, 70, 90)
+          }
+        }
+      }
 
+      Column {
+        width: parent.width
+        visible: root.cpuCores.length > 0
+        spacing: Style.space(6)
+        Text {
+          text: root.cpuCores.length + " CORES"
+          color: root.muted
+          font.pixelSize: Style.font.bodySmall
+          font.bold: true
+        }
+        Grid {
+          id: coresGrid
+          width: parent.width
+          columns: root.cpuCores.length <= 8 ? 2 : (root.cpuCores.length <= 16 ? 4 : 6)
+          columnSpacing: Style.space(6)
+          rowSpacing: Style.space(4)
+          Repeater {
+            model: root.cpuCores
+            delegate: Rectangle {
+              required property var modelData
+              width: (parent.width - parent.columnSpacing * (parent.columns - 1)) / parent.columns
+              height: Style.space(20)
+              radius: Style.space(3)
+              color: "transparent"
+              border.color: root.fg
+              border.width: 1
+              opacity: 0.9
+              Rectangle {
+                anchors.left: parent.left
+                anchors.top: parent.top
+                anchors.bottom: parent.bottom
+                color: root.levelColor(modelData.percent, 60, 80)
+                opacity: 0.35
+                radius: parent.radius
+                width: parent.width * Math.max(0, Math.min(1, modelData.percent / 100.0))
+              }
+              Text {
+                anchors.centerIn: parent
+                text: "C" + modelData.core
+                color: root.fg
+                font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                font.pixelSize: Style.font.caption
+                font.bold: true
+              }
+            }
+          }
+        }
+      }
+
+      PanelSeparator { foreground: root.fg }
+
+      Column {
+        width: parent.width
+        spacing: Style.space(6)
         RowLayout {
           width: parent.width
           Text {
@@ -289,21 +447,265 @@ Panel {
           }
         }
         Text {
-          text: "avail " + root.memAvail + "G · swap " + root.swapUsed + "/" + root.swapTotal + "G"
+          text: "avail " + root.memAvail + "G · swap " + root.swapUsed + "/" + root.swapTotal + "G" + (root.ramInfo ? " · " + root.ramInfo : "")
           color: root.muted
           font.pixelSize: Style.font.bodySmall
         }
       }
 
+      PanelSeparator { foreground: root.fg }
+
+      Column {
+        width: parent.width
+        visible: root.gpuName !== "GPU" || root.gpuLoad >= 0 || root.gpuTemp !== "--"
+        spacing: Style.space(6)
+        RowLayout {
+          width: parent.width
+          Text {
+            text: root.gpuName
+            color: root.fg
+            font.bold: true
+            font.pixelSize: Style.font.bodySmall
+          }
+          Item {
+            Layout.fillWidth: true
+          }
+          Text {
+            text: (root.gpuLoad >= 0 ? root.gpuLoad + "% " : "") + root.gpuTemp
+            color: root.tempColor(root.gpuTemp)
+            font.bold: true
+            font.pixelSize: Style.font.bodySmall
+          }
+        }
+        Rectangle {
+          visible: root.gpuLoad >= 0
+          width: parent.width
+          height: Style.space(7)
+          radius: 3.5
+          color: root.fg
+          opacity: 0.15
+          Rectangle {
+            width: Math.max(4, parent.width * (root.gpuLoad / 100.0))
+            height: parent.height
+            radius: 3.5
+            color: root.levelColor(root.gpuLoad, 70, 90)
+          }
+        }
+      }
+
+      PanelSeparator {
+        visible: root.disks.length > 0
+        foreground: root.fg
+      }
+
+      Column {
+        width: parent.width
+        visible: root.disks.length > 0
+        spacing: Style.space(6)
+        Text {
+          text: "Storage"
+          color: root.fg
+          font.bold: true
+          font.pixelSize: Style.font.bodySmall
+        }
+        Column {
+          width: parent.width
+          spacing: Style.space(4)
+          Repeater {
+            model: root.disks
+            delegate: Column {
+              required property var modelData
+              width: parent.width
+              spacing: Style.space(2)
+              RowLayout {
+                width: parent.width
+                Text {
+                  text: modelData.mount
+                  color: root.fg
+                  font.pixelSize: Style.font.caption
+                  font.bold: true
+                  Layout.preferredWidth: 100
+                  elide: Text.ElideRight
+                }
+                Item {
+                  Layout.fillWidth: true
+                }
+                Text {
+                  text: modelData.used_gb + " / " + modelData.total_gb + "G (" + modelData.percent + "%)"
+                  color: root.levelColor(modelData.percent, 80, 95)
+                  font.pixelSize: Style.font.caption
+                }
+              }
+              Rectangle {
+                width: parent.width
+                height: Style.space(5)
+                radius: 2.5
+                color: root.fg
+                opacity: 0.15
+                Rectangle {
+                  width: Math.max(4, parent.width * (modelData.percent / 100.0))
+                  height: parent.height
+                  radius: 2.5
+                  color: root.levelColor(modelData.percent, 80, 95)
+                }
+              }
+            }
+          }
+        }
+      }
+
+      PanelSeparator { foreground: root.fg }
+
+      Column {
+        width: parent.width
+        spacing: Style.space(8)
+        Text {
+          text: "Fans " + root.fan1Rpm + " / " + root.fan2Rpm + " RPM"
+          color: root.fg
+          font.pixelSize: Style.font.bodySmall
+        }
+        Row {
+          width: parent.width
+          spacing: Style.space(6)
+          Repeater {
+            model: ["auto", "low", "med", "high", "custom"]
+            delegate: Rectangle {
+              required property string modelData
+              width: (parent.width - Style.space(24)) / 5
+              height: Style.space(34)
+              radius: Style.space(6)
+              opacity: root.fanControl ? 1 : 0.4
+              color: root.currentMode === modelData ? root.fg : "transparent"
+              border.color: root.fg
+              border.width: 1
+              Text {
+                anchors.centerIn: parent
+                text: modelData === "auto" ? "Auto" : (modelData === "low" ? "Low" : (modelData === "med" ? "Med" : (modelData === "high" ? "High" : "Cust")))
+                color: root.currentMode === modelData ? Color.background : root.fg
+                font.bold: true
+                font.pixelSize: Style.font.caption
+              }
+              MouseArea {
+                anchors.fill: parent
+                enabled: root.fanControl
+                cursorShape: Qt.PointingHandCursor
+                onClicked: root.setMode(modelData)
+              }
+            }
+          }
+        }
+        Row {
+          width: parent.width
+          spacing: Style.space(6)
+          visible: root.currentMode === "custom"
+          Repeater {
+            model: ["silent", "balanced", "performance"]
+            delegate: Rectangle {
+              required property string modelData
+              width: (parent.width - Style.space(12)) / 3
+              height: Style.space(28)
+              radius: Style.space(6)
+              opacity: root.fanControl ? 1 : 0.4
+              color: root.customName === modelData ? root.accent : "transparent"
+              border.color: root.fg
+              border.width: 1
+              Text {
+                anchors.centerIn: parent
+                text: modelData.charAt(0).toUpperCase() + modelData.slice(1)
+                color: root.customName === modelData ? Color.background : root.fg
+                font.bold: true
+                font.pixelSize: Style.font.caption
+              }
+              MouseArea {
+                anchors.fill: parent
+                enabled: root.fanControl
+                cursorShape: Qt.PointingHandCursor
+                onClicked: root.setCustom(modelData)
+              }
+            }
+          }
+        }
+        Canvas {
+          id: curveCanvas
+          visible: root.currentMode === "custom" && root.fanCurve.length > 1
+          width: parent.width
+          height: Style.space(70)
+          onPaint: {
+            var ctx = getContext("2d")
+            ctx.clearRect(0, 0, width, height)
+            if (!root.fanCurve || root.fanCurve.length < 2)
+              return
+            var pad = 8
+            var cw = width - pad * 2
+            var ch = height - pad * 2
+            var tMax = 100
+            var pMax = 255
+            var pts = root.fanCurve
+
+            ctx.strokeStyle = "rgba(" + Math.round(root.fg.r * 255) + "," + Math.round(root.fg.g * 255) + "," + Math.round(root.fg.b * 255) + ",0.15)"
+            ctx.lineWidth = 1
+            ctx.beginPath()
+            ctx.moveTo(pad, pad)
+            ctx.lineTo(pad, height - pad)
+            ctx.lineTo(width - pad, height - pad)
+            ctx.stroke()
+
+            ctx.strokeStyle = root.accent
+            ctx.lineWidth = 2
+            ctx.beginPath()
+            for (var i = 0; i < pts.length; i++) {
+              var t = pts[i][0]
+              var p = pts[i][1]
+              var x = pad + (t / tMax) * cw
+              var y = (height - pad) - (p / pMax) * ch
+              if (i === 0)
+                ctx.moveTo(x, y)
+              else
+                ctx.lineTo(x, y)
+            }
+            ctx.stroke()
+
+            var ct = parseInt(root.cpuTemp)
+            if (!isNaN(ct)) {
+              ctx.fillStyle = root.urgent
+              ctx.beginPath()
+              var cx = pad + Math.min(1, Math.max(0, ct / tMax)) * cw
+              ctx.arc(cx, height - pad - 4, 3, 0, Math.PI * 2)
+              ctx.fill()
+            }
+          }
+          Connections {
+            target: root
+            function onFanCurveChanged() {
+              if (curveCanvas.visible)
+                curveCanvas.requestPaint()
+            }
+          }
+        }
+      }
+
+      PanelSeparator { foreground: root.fg }
+
       Column {
         width: parent.width
         spacing: Style.space(4)
         visible: root.topMem && root.topMem.length > 0
-        Text {
-          text: "TOP MEMORY  ·  j/k  x kill"
-          color: root.muted
-          font.pixelSize: Style.font.bodySmall
-          font.bold: true
+        RowLayout {
+          width: parent.width
+          Text {
+            text: "TOP MEMORY  ·  j/k  x kill"
+            color: root.muted
+            font.pixelSize: Style.font.bodySmall
+            font.bold: true
+          }
+          Item {
+            Layout.fillWidth: true
+          }
+          Text {
+            text: "b btop"
+            color: root.muted
+            font.pixelSize: Style.font.caption
+          }
         }
         Repeater {
           model: root.topMem
@@ -328,7 +730,7 @@ Panel {
                 color: root.fg
                 font.bold: true
                 font.pixelSize: Style.font.bodySmall
-                Layout.preferredWidth: 130
+                Layout.preferredWidth: 120
                 elide: Text.ElideRight
               }
               Text {
@@ -362,66 +764,6 @@ Panel {
                   onClicked: root.killProcess(modelData.pid)
                 }
               }
-            }
-          }
-        }
-      }
-
-      Text {
-        visible: !root.topMem || root.topMem.length === 0
-        text: "No heavy processes"
-        color: root.muted
-        font.pixelSize: Style.font.bodySmall
-      }
-
-      Rectangle {
-        width: parent.width
-        height: 1
-        color: root.fg
-        opacity: 0.12
-      }
-
-      Column {
-        width: parent.width
-        spacing: Style.space(6)
-        Text {
-          text: "CPU " + root.cpuLoad + "%  " + root.cpuTemp + " · GPU " + root.gpuTemp + " · SSD " + root.nvmeTemp
-          color: root.fg
-          font.pixelSize: Style.font.bodySmall
-        }
-        Text {
-          text: "Fans " + root.fan1Rpm + " / " + root.fan2Rpm + " RPM"
-          color: root.fg
-          font.pixelSize: Style.font.bodySmall
-        }
-      }
-
-      Row {
-        width: parent.width
-        spacing: Style.space(6)
-        Repeater {
-          model: ["auto", "low", "med", "high"]
-          delegate: Rectangle {
-            required property string modelData
-            width: (parent.width - Style.space(18)) / 4
-            height: Style.space(34)
-            radius: Style.space(6)
-            opacity: root.fanControl ? 1 : 0.4
-            color: root.currentMode === modelData ? root.fg : "transparent"
-            border.color: root.fg
-            border.width: 1
-            Text {
-              anchors.centerIn: parent
-              text: modelData === "auto" ? "Auto" : (modelData === "low" ? "Low" : (modelData === "med" ? "Med" : "High"))
-              color: root.currentMode === modelData ? Color.background : root.fg
-              font.bold: true
-              font.pixelSize: Style.font.bodySmall
-            }
-            MouseArea {
-              anchors.fill: parent
-              enabled: root.fanControl
-              cursorShape: Qt.PointingHandCursor
-              onClicked: root.setMode(modelData)
             }
           }
         }

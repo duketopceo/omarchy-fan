@@ -1,21 +1,34 @@
 #!/usr/bin/env python3
-"""Omarchy Fan Auto-Curve & Profile Daemon for Dell Precision / Linux.
-
-Features:
-- Auto-curve: Tracks CPU/GPU temperatures and AC/Battery state.
-- AC mode: Aggressive cooling (kicks high >= 58°C, cools down into 40-50s).
-- Battery mode: Loosened curve (kicks >= 65°C to preserve battery life).
-- Direct ACPI platform_profile integration ('cool', 'balanced', 'quiet').
-- Manual mode override ('auto', 'low', 'med', 'high') via /tmp/current_fan_mode.
-"""
+"""Omarchy Fan Daemon: auto-curve, fixed presets, and a custom temperature curve."""
 
 from __future__ import annotations
 
 import glob
+import json
 import os
-import subprocess
 import time
 from pathlib import Path
+
+
+DEFAULT_CURVE = [
+    [0, 0],
+    [35, 80],
+    [45, 120],
+    [55, 170],
+    [65, 210],
+    [75, 255],
+]
+
+
+def config_home() -> Path:
+    env = os.environ.get("XDG_CONFIG_HOME")
+    if env:
+        return Path(env)
+    return Path.home() / ".config"
+
+
+def curve_path() -> Path:
+    return config_home() / "omarchy" / "fan_curve.json"
 
 
 def get_hwmon_dell() -> Path | None:
@@ -31,12 +44,10 @@ def get_hwmon_dell() -> Path | None:
 
 def get_max_temp() -> int:
     temps: list[int] = []
-    # Check thermal zones
     for temp_file in glob.glob("/sys/class/thermal/thermal_zone*/temp"):
         try:
             with open(temp_file, "r") as f:
                 val = int(f.read().strip())
-                # Handle millidegrees
                 if val > 1000:
                     val = round(val / 1000)
                 if 10 <= val <= 115:
@@ -44,7 +55,6 @@ def get_max_temp() -> int:
         except (OSError, ValueError):
             continue
 
-    # Check dell_ddv sensors
     for temp_file in glob.glob("/sys/class/hwmon/hwmon*/temp*_input"):
         try:
             with open(temp_file, "r") as f:
@@ -101,7 +111,7 @@ def set_pwm(hwmon: Path | None, pwm_val: int) -> None:
         try:
             p_path = hwmon / pwm_name
             if p_path.is_file():
-                p_path.write_text(str(pwm_val))
+                p_path.write_text(str(max(0, min(255, pwm_val))))
         except OSError:
             pass
 
@@ -112,11 +122,44 @@ def get_requested_mode() -> str:
         return "auto"
     try:
         mode = mode_path.read_text().strip().lower()
-        if mode in {"auto", "low", "med", "high"}:
+        if mode in {"auto", "low", "med", "high", "custom"} or mode.startswith("custom-"):
             return mode
     except OSError:
         pass
     return "auto"
+
+
+def load_curve() -> list[list[int]]:
+    path = curve_path()
+    if not path.is_file():
+        return DEFAULT_CURVE
+    try:
+        data = json.loads(path.read_text())
+        if isinstance(data, list) and all(isinstance(p, list) and len(p) == 2 for p in data):
+            return [[int(p[0]), int(p[1])] for p in data]
+    except (OSError, ValueError):
+        pass
+    return DEFAULT_CURVE
+
+
+def curve_pwm(temp: int, curve: list[list[int]]) -> int:
+    """Linearly interpolate a PWM for the given temp from (temp, pwm) points."""
+    if not curve:
+        return 0
+    # ensure sorted by temperature
+    curve = sorted(curve, key=lambda p: p[0])
+    if temp <= curve[0][0]:
+        return curve[0][1]
+    if temp >= curve[-1][0]:
+        return curve[-1][1]
+    for i in range(len(curve) - 1):
+        t1, p1 = curve[i]
+        t2, p2 = curve[i + 1]
+        if t1 <= temp <= t2:
+            if t2 == t1:
+                return p1
+            return round(p1 + (p2 - p1) * (temp - t1) / (t2 - t1))
+    return curve[-1][1]
 
 
 def main() -> None:
@@ -128,18 +171,16 @@ def main() -> None:
 
         if mode == "auto":
             if on_ac:
-                # AC Profile: Target keeping CPU strictly in the 50s
                 if temp >= 58:
                     set_platform_profile("cool")
-                    set_pwm(hwmon, 255)  # Max Fan
+                    set_pwm(hwmon, 255)
                 elif temp >= 52:
                     set_platform_profile("cool")
-                    set_pwm(hwmon, 204)  # High Fan
+                    set_pwm(hwmon, 204)
                 elif temp <= 48:
                     set_platform_profile("balanced")
-                    set_pwm(hwmon, 140)  # Low-Med Fan
+                    set_pwm(hwmon, 140)
             else:
-                # Battery Profile: Loosen slightly to protect battery life
                 if temp >= 65:
                     set_platform_profile("cool")
                     set_pwm(hwmon, 230)
@@ -150,17 +191,29 @@ def main() -> None:
                     set_platform_profile("quiet")
                     set_pwm(hwmon, 100)
 
-        elif mode == "high":
-            set_platform_profile("cool")
-            set_pwm(hwmon, 255)
+        elif mode == "low":
+            set_platform_profile("quiet")
+            set_pwm(hwmon, 128)
 
         elif mode == "med":
             set_platform_profile("balanced")
             set_pwm(hwmon, 204)
 
-        elif mode == "low":
-            set_platform_profile("quiet")
-            set_pwm(hwmon, 128)
+        elif mode == "high":
+            set_platform_profile("cool")
+            set_pwm(hwmon, 255)
+
+        elif mode == "custom" or mode.startswith("custom-"):
+            curve = load_curve()
+            pwm = curve_pwm(temp, curve)
+            # switch platform profile at the warm end of the curve
+            if temp >= 65:
+                set_platform_profile("cool")
+            elif temp >= 55:
+                set_platform_profile("balanced")
+            else:
+                set_platform_profile("quiet")
+            set_pwm(hwmon, pwm)
 
         time.sleep(2)
 
