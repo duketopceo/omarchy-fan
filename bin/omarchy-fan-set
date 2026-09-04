@@ -1,0 +1,4 @@
+#!/bin/bash
+MODE="${1:-auto}"
+printf "%s" "$MODE" > /tmp/current_fan_mode
+chmod 666 /tmp/current_fan_mode 2>/dev/null || true

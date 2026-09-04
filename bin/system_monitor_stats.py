@@ -183,12 +183,12 @@ def read_temps(hwmon: dict[str, Path] | None = None) -> tuple[str, str, str, int
 def read_fan_mode(path: Path | None = None) -> str:
     mode_path = path or Path("/tmp/current_fan_mode")
     if not mode_path.is_file():
-        return "med"
+        return "auto"
     try:
-        mode = mode_path.read_text().strip()
+        mode = mode_path.read_text().strip().lower()
     except OSError:
-        return "med"
-    return mode if mode in {"low", "med", "high"} else "med"
+        return "auto"
+    return mode if mode in {"auto", "low", "med", "high"} else "auto"
 
 
 def collect(sample_seconds: float = 0.1) -> dict[str, Any]:

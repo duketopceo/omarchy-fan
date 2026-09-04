@@ -1,0 +1,169 @@
+#!/usr/bin/env python3
+"""Omarchy Fan Auto-Curve & Profile Daemon for Dell Precision / Linux.
+
+Features:
+- Auto-curve: Tracks CPU/GPU temperatures and AC/Battery state.
+- AC mode: Aggressive cooling (kicks high >= 58°C, cools down into 40-50s).
+- Battery mode: Loosened curve (kicks >= 65°C to preserve battery life).
+- Direct ACPI platform_profile integration ('cool', 'balanced', 'quiet').
+- Manual mode override ('auto', 'low', 'med', 'high') via /tmp/current_fan_mode.
+"""
+
+from __future__ import annotations
+
+import glob
+import os
+import subprocess
+import time
+from pathlib import Path
+
+
+def get_hwmon_dell() -> Path | None:
+    for name_file in glob.glob("/sys/class/hwmon/hwmon*/name"):
+        try:
+            with open(name_file, "r") as f:
+                if "dell_smm" in f.read():
+                    return Path(name_file).parent
+        except OSError:
+            continue
+    return None
+
+
+def get_max_temp() -> int:
+    temps: list[int] = []
+    # Check thermal zones
+    for temp_file in glob.glob("/sys/class/thermal/thermal_zone*/temp"):
+        try:
+            with open(temp_file, "r") as f:
+                val = int(f.read().strip())
+                # Handle millidegrees
+                if val > 1000:
+                    val = round(val / 1000)
+                if 10 <= val <= 115:
+                    temps.append(val)
+        except (OSError, ValueError):
+            continue
+
+    # Check dell_ddv sensors
+    for temp_file in glob.glob("/sys/class/hwmon/hwmon*/temp*_input"):
+        try:
+            with open(temp_file, "r") as f:
+                val = round(int(f.read().strip()) / 1000)
+                if 10 <= val <= 115:
+                    temps.append(val)
+        except (OSError, ValueError):
+            continue
+
+    return max(temps) if temps else 50
+
+
+def is_on_ac() -> bool:
+    for ac_file in glob.glob("/sys/class/power_supply/A*/online"):
+        try:
+            with open(ac_file, "r") as f:
+                if f.read().strip() == "1":
+                    return True
+        except OSError:
+            continue
+    for bat_status in glob.glob("/sys/class/power_supply/BAT*/status"):
+        try:
+            with open(bat_status, "r") as f:
+                status = f.read().strip().lower()
+                if status in {"charging", "full", "not charging"}:
+                    return True
+        except OSError:
+            continue
+    return False
+
+
+def set_platform_profile(profile: str) -> None:
+    path = Path("/sys/firmware/acpi/platform_profile")
+    if not path.is_file():
+        return
+    try:
+        current = path.read_text().strip()
+        if current != profile:
+            path.write_text(profile)
+    except OSError:
+        pass
+
+
+def set_pwm(hwmon: Path | None, pwm_val: int) -> None:
+    if not hwmon:
+        return
+    for pwm_name, enable_name in [("pwm1", "pwm1_enable"), ("pwm2", "pwm2_enable")]:
+        try:
+            en_path = hwmon / enable_name
+            if en_path.is_file():
+                en_path.write_text("1")
+        except OSError:
+            pass
+        try:
+            p_path = hwmon / pwm_name
+            if p_path.is_file():
+                p_path.write_text(str(pwm_val))
+        except OSError:
+            pass
+
+
+def get_requested_mode() -> str:
+    mode_path = Path("/tmp/current_fan_mode")
+    if not mode_path.is_file():
+        return "auto"
+    try:
+        mode = mode_path.read_text().strip().lower()
+        if mode in {"auto", "low", "med", "high"}:
+            return mode
+    except OSError:
+        pass
+    return "auto"
+
+
+def main() -> None:
+    hwmon = get_hwmon_dell()
+    while True:
+        mode = get_requested_mode()
+        temp = get_max_temp()
+        on_ac = is_on_ac()
+
+        if mode == "auto":
+            if on_ac:
+                # AC Profile: Target keeping CPU strictly in the 50s
+                if temp >= 58:
+                    set_platform_profile("cool")
+                    set_pwm(hwmon, 255)  # Max Fan
+                elif temp >= 52:
+                    set_platform_profile("cool")
+                    set_pwm(hwmon, 204)  # High Fan
+                elif temp <= 48:
+                    set_platform_profile("balanced")
+                    set_pwm(hwmon, 140)  # Low-Med Fan
+            else:
+                # Battery Profile: Loosen slightly to protect battery life
+                if temp >= 65:
+                    set_platform_profile("cool")
+                    set_pwm(hwmon, 230)
+                elif temp >= 58:
+                    set_platform_profile("balanced")
+                    set_pwm(hwmon, 170)
+                elif temp <= 52:
+                    set_platform_profile("quiet")
+                    set_pwm(hwmon, 100)
+
+        elif mode == "high":
+            set_platform_profile("cool")
+            set_pwm(hwmon, 255)
+
+        elif mode == "med":
+            set_platform_profile("balanced")
+            set_pwm(hwmon, 204)
+
+        elif mode == "low":
+            set_platform_profile("quiet")
+            set_pwm(hwmon, 128)
+
+        time.sleep(2)
+
+
+if __name__ == "__main__":
+    main()

@@ -10,7 +10,7 @@ Panel {
   moduleName: "lukedaduke.fan"
   ipcTarget: "lukedaduke.fan"
 
-  property string currentMode: "high"
+  property string currentMode: "auto"
   property int cpuLoad: 0
   property int memPct: 0
   property string memUsed: "--"
@@ -55,12 +55,14 @@ Panel {
   function cycleMode() {
     if (!root.fanControl)
       return
-    if (currentMode === "low")
+    if (currentMode === "auto")
+      setMode("low")
+    else if (currentMode === "low")
       setMode("med")
     else if (currentMode === "med")
       setMode("high")
     else
-      setMode("low")
+      setMode("auto")
   }
 
   function killProcess(pid) {
@@ -160,10 +162,10 @@ Panel {
     id: button
     anchors.fill: parent
     bar: root.bar
-    text: "󰍛 " + root.memUsed + "G " + root.memPct + "%  " + root.cpuTemp + "  " + (root.currentMode === "high" ? "H" : (root.currentMode === "med" ? "M" : "L"))
+    text: "󰍛 " + root.memUsed + "G " + root.memPct + "%  " + root.cpuTemp + "  " + (root.currentMode === "auto" ? "A" : (root.currentMode === "high" ? "H" : (root.currentMode === "med" ? "M" : "L")))
     fontSize: Style.font.bodySmall
-    active: root.memPct >= 80 || root.currentMode === "high"
-    activeColor: root.memPct >= 85 ? root.urgent : (root.bar ? root.bar.urgent : Color.urgent)
+    active: root.memPct >= 80 || root.currentMode === "high" || (root.currentMode === "auto" && parseInt(root.cpuTemp) >= 60)
+    activeColor: root.memPct >= 85 || parseInt(root.cpuTemp) >= 65 ? root.urgent : (root.bar ? root.bar.urgent : Color.urgent)
     tooltipText: "RAM " + root.memUsed + "/" + root.memTotal + "G · CPU " + root.cpuLoad + "% " + root.cpuTemp + " · GPU " + root.gpuTemp + " · SSD " + root.nvmeTemp + (root.fanControl ? " · right-click cycles fan" : " · fan control unavailable")
     horizontalMargin: 6.0
     onPressed: function (buttonCode) {
@@ -396,13 +398,13 @@ Panel {
 
       Row {
         width: parent.width
-        spacing: Style.space(8)
+        spacing: Style.space(6)
         Repeater {
-          model: ["low", "med", "high"]
+          model: ["auto", "low", "med", "high"]
           delegate: Rectangle {
             required property string modelData
-            width: (parent.width - Style.space(16)) / 3
-            height: Style.space(36)
+            width: (parent.width - Style.space(18)) / 4
+            height: Style.space(34)
             radius: Style.space(6)
             opacity: root.fanControl ? 1 : 0.4
             color: root.currentMode === modelData ? root.fg : "transparent"
@@ -410,7 +412,7 @@ Panel {
             border.width: 1
             Text {
               anchors.centerIn: parent
-              text: modelData === "low" ? "Low" : (modelData === "med" ? "Med" : "High")
+              text: modelData === "auto" ? "Auto" : (modelData === "low" ? "Low" : (modelData === "med" ? "Med" : "High"))
               color: root.currentMode === modelData ? Color.background : root.fg
               font.bold: true
               font.pixelSize: Style.font.bodySmall
