@@ -248,8 +248,8 @@ Panel {
     owner: root
     bar: root.bar
     open: root.opened
-    contentWidth: panel.fittedContentWidth(Style.space(420))
-    contentHeight: panel.fittedContentHeight(mainColumn.implicitHeight)
+    contentWidth: panel.fittedContentWidth(Style.space(340), 420)
+    contentHeight: panel.fittedContentHeight(mainColumn.implicitHeight, 720)
     Keys.onPressed: function (event) {
       if (event.key === Qt.Key_J) {
         root.selectedProc = Math.min(root.topMem.length - 1, root.selectedProc + 1)
@@ -269,8 +269,7 @@ Panel {
     Column {
       id: mainColumn
       width: parent.width
-      spacing: Style.space(12)
-      padding: Style.space(14)
+      spacing: Style.space(8)
 
       RowLayout {
         width: parent.width
