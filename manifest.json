@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "lukedaduke.fan",
   "name": "Resource & Fan",
-  "version": "2.1.0",
+  "version": "2.1.1",
   "author": "lukedaduke",
   "license": "MIT",
   "description": "RAM, CPU/GPU/NVMe thermals, top processes, and fan presets in the Omarchy bar.",

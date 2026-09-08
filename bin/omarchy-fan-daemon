@@ -6,6 +6,7 @@ from __future__ import annotations
 import glob
 import json
 import os
+import stat
 import time
 from pathlib import Path
 
@@ -29,6 +30,23 @@ def config_home() -> Path:
 
 def curve_path() -> Path:
     return config_home() / "omarchy" / "fan_curve.json"
+
+
+def runtime_dir() -> Path:
+    base = os.environ.get("XDG_RUNTIME_DIR")
+    if not base:
+        base = os.path.join(os.path.expanduser("~"), ".local", "run")
+    d = Path(base) / "omarchy-fan"
+    d.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        os.chmod(d, 0o700)
+    except OSError:
+        pass
+    return d
+
+
+def mode_path() -> Path:
+    return runtime_dir() / "current_fan_mode"
 
 
 def get_hwmon_dell() -> Path | None:
@@ -117,11 +135,18 @@ def set_pwm(hwmon: Path | None, pwm_val: int) -> None:
 
 
 def get_requested_mode() -> str:
-    mode_path = Path("/tmp/current_fan_mode")
-    if not mode_path.is_file():
+    path = mode_path()
+    if not path.is_file():
         return "auto"
     try:
-        mode = mode_path.read_text().strip().lower()
+        # Open with O_NOFOLLOW to avoid following a symlink placed by another user.
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid():
+            os.close(fd)
+            return "auto"
+        with os.fdopen(fd, "r") as fh:
+            mode = fh.read().strip().lower()
         if mode in {"auto", "low", "med", "high", "custom"} or mode.startswith("custom-"):
             return mode
     except OSError:
