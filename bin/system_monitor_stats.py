@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3
 """System stats JSON for the lukedaduke.fan panel."""
 
 from __future__ import annotations
@@ -6,6 +6,10 @@ from __future__ import annotations
 import json
 import os
 import re
+import selectors
+import shutil
+import signal
+import stat
 import subprocess
 import sys
 import time
@@ -14,6 +18,102 @@ from typing import Any
 
 SAMPLE_SECONDS = 0.1
 MIN_MEM_MB = 15
+JOB_DEADLINE_S = 8
+MAX_OUT_BYTES = 262144
+MAX_STR = 96
+MAX_LIST = 64
+
+# Fixed search path for external tools: a PATH-preceding shadow binary in the
+# caller's environment must never execute inside the long-lived shell process.
+SAFE_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
+SAFE_ENV = {
+    "PATH": SAFE_PATH,
+    "LC_ALL": "C",
+    "LANG": "C",
+}
+
+
+def _tool(name: str) -> str | None:
+    """Absolute path for an external helper, resolved under SAFE_PATH only."""
+    return shutil.which(name, path=SAFE_PATH)
+
+
+def _kill_tree(proc: subprocess.Popen) -> None:
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+    except (OSError, ProcessLookupError):
+        pass
+    try:
+        proc.wait(timeout=0.5)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (OSError, ProcessLookupError):
+            pass
+        try:
+            proc.wait(timeout=0.5)
+        except subprocess.TimeoutExpired:
+            pass
+
+
+def _run(argv: list[str], timeout: float = 2.0,
+       max_bytes: int = MAX_OUT_BYTES) -> str | None:
+    """Run argv with a minimal env, a hard deadline, and a producer byte cap.
+
+    Returns stdout decoded as text, or None on failure/timeout/overflow.
+    The child runs in its own process group so TERM/KILL reaches the tree.
+    """
+    if not argv or not argv[0]:
+        return None
+    try:
+        proc = subprocess.Popen(
+            argv,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            env=SAFE_ENV,
+            start_new_session=True,
+        )
+    except OSError:
+        return None
+    buf = bytearray()
+    deadline = time.monotonic() + timeout
+    completed = False
+    sel = selectors.DefaultSelector()
+    try:
+        sel.register(proc.stdout, selectors.EVENT_READ)
+        while True:
+            if proc.poll() is not None:
+                tail = proc.stdout.read()
+                if tail:
+                    buf += tail
+                completed = True
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            if not sel.select(remaining):
+                break
+            try:
+                chunk = os.read(proc.stdout.fileno(), 65536)
+            except OSError:
+                break
+            if not chunk:
+                completed = True  # producer closed stdout; nothing more to read
+                break
+            buf += chunk
+            if len(buf) > max_bytes:
+                break
+    finally:
+        sel.close()
+        if proc.poll() is None:
+            _kill_tree(proc)
+        try:
+            proc.stdout.close()
+        except OSError:
+            pass
+    if not completed or len(buf) > max_bytes:
+        return None
+    return buf.decode(errors="replace")
 
 
 def _read_proc_stat() -> dict[str, tuple[int, int]]:
@@ -117,15 +217,14 @@ def read_meminfo(meminfo_path: Path | None = None) -> dict[str, Any]:
 
 
 def _ps_rows(sort_key: str, fields: str) -> list[list[str]]:
-    try:
-        out = subprocess.check_output(
-            ["ps", "-eo", fields, f"--sort=-{sort_key}"],
-            text=True,
-            timeout=2,
-        ).strip()
-    except (OSError, subprocess.SubprocessError) as exc:
-        print(f"ps failed: {exc}", file=sys.stderr)
+    ps = _tool("ps")
+    if not ps:
         return []
+    out = _run([ps, "-eo", fields, f"--sort=-{sort_key}"], timeout=2)
+    if out is None:
+        print("ps failed", file=sys.stderr)
+        return []
+    out = out.strip()
     rows: list[list[str]] = []
     for line in out.splitlines()[1:]:
         parts = line.strip().split(None, 3)
@@ -268,25 +367,27 @@ def gpu_info() -> tuple[str, int | None, str]:
     gpu_temp = "--"
 
     # NVIDIA
-    if Path("/proc/driver/nvidia/version").is_file():
+    nvidia = _tool("nvidia-smi")
+    if nvidia and Path("/proc/driver/nvidia/version").is_file():
+        out_text = _run(
+            [nvidia, "--query-gpu=utilization.gpu,temperature.gpu,name",
+             "--format=csv,noheader,nounits"],
+            timeout=1, max_bytes=8192,
+        )
         try:
-            out = subprocess.check_output(
-                ["nvidia-smi", "--query-gpu=utilization.gpu,temperature.gpu,name",
-                 "--format=csv,noheader,nounits"],
-                text=True,
-                timeout=1,
-            ).strip().splitlines()[0].split(",")
-            if len(out) >= 3:
-                load = out[0].strip()
-                temp = out[1].strip()
-                name = out[2].strip()
-                if load:
-                    gpu_load = max(0, min(100, round(float(load))))
-                if temp:
-                    gpu_temp = f"{round(float(temp))}°C"
-                gpu_name = _clean_gpu_name(name)
-                return gpu_name, gpu_load, gpu_temp
-        except (OSError, subprocess.SubprocessError, ValueError):
+            if out_text:
+                out = out_text.strip().splitlines()[0].split(",")
+                if len(out) >= 3:
+                    load = out[0].strip()
+                    temp = out[1].strip()
+                    name = out[2].strip()
+                    if load:
+                        gpu_load = max(0, min(100, round(float(load))))
+                    if temp:
+                        gpu_temp = f"{round(float(temp))}°C"
+                    gpu_name = _clean_gpu_name(name)
+                    return gpu_name, gpu_load, gpu_temp
+        except (ValueError, IndexError):
             pass
 
     # AMD gpu_busy_percent
@@ -326,9 +427,11 @@ def _clean_gpu_name(raw: str) -> str:
 
 
 def _gpu_name_from_lspci() -> str | None:
-    try:
-        out = subprocess.check_output(["lspci", "-mm"], text=True, timeout=2)
-    except (OSError, subprocess.SubprocessError):
+    lspci = _tool("lspci")
+    if not lspci:
+        return None
+    out = _run([lspci, "-mm"], timeout=2)
+    if out is None:
         return None
     for line in out.splitlines():
         if "VGA" not in line and "3D controller" not in line and "Display controller" not in line:
@@ -343,19 +446,19 @@ def _gpu_name_from_lspci() -> str | None:
 
 def ram_info() -> str:
     """Try to produce a short RAM type + speed label."""
-    try:
-        out = subprocess.check_output(["inxi", "-m", "-c0"], text=True, timeout=2, stderr=subprocess.DEVNULL)
-    except (OSError, subprocess.SubprocessError):
-        out = ""
+    inxi = _tool("inxi")
+    out = _run([inxi, "-m", "-c0"], timeout=2) if inxi else None
     if out:
         # Look for Memory: ... type: DDR4 ... speed: 3200 MT/s
         m = re.search(r"type:\s*([^\s,]+).*?speed:\s*([^\s,]+)\s*MT/s", out, re.I | re.S)
         if m:
             return f"{m.group(1).strip()} {m.group(2).strip()} MT/s"
     # dmidecode usually needs root, but try in case it works
-    try:
-        out = subprocess.check_output(["dmidecode", "-t", "memory"], text=True, timeout=1, stderr=subprocess.DEVNULL)
-    except (OSError, subprocess.SubprocessError):
+    dmidecode = _tool("dmidecode")
+    if not dmidecode:
+        return ""
+    out = _run([dmidecode, "-t", "memory"], timeout=1)
+    if out is None:
         return ""
     types: set[str] = set()
     speeds: set[str] = set()
@@ -389,14 +492,13 @@ ALLOWED_FS = {
 
 
 def disk_usage() -> list[dict[str, Any]]:
-    try:
-        out = subprocess.check_output(
-            ["df", "-P", "-T", "-l", "--block-size=1"],
-            text=True,
-            timeout=2,
-        ).strip()
-    except (OSError, subprocess.SubprocessError):
+    df = _tool("df")
+    if not df:
         return []
+    out = _run([df, "-P", "-T", "-l", "--block-size=1"], timeout=2)
+    if out is None:
+        return []
+    out = out.strip()
 
     by_device: dict[str, dict[str, Any]] = {}
     for line in out.splitlines()[1:]:
@@ -429,13 +531,31 @@ def disk_usage() -> list[dict[str, Any]]:
     return sorted(by_device.values(), key=lambda x: (x["mount"] != "/", x["mount"]))
 
 
+def _runtime_dir() -> Path:
+    base = os.environ.get("XDG_RUNTIME_DIR") or os.path.join(
+        os.path.expanduser("~"), ".local", "run"
+    )
+    return Path(base) / "omarchy-fan"
+
+
 def read_fan_mode(path: Path | None = None) -> str:
-    mode_path = path or Path("/tmp/current_fan_mode")
-    if not mode_path.is_file():
+    mode_path = path or _runtime_dir() / "current_fan_mode"
+    try:
+        fd = os.open(mode_path, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError:
         return "auto"
     try:
-        mode = mode_path.read_text().strip().lower()
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid():
+            os.close(fd)
+            return "auto"
+        with os.fdopen(fd, "r") as fh:
+            mode = fh.read(64).strip().lower()
     except OSError:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
         return "auto"
     return mode if mode in {"auto", "low", "med", "high", "custom"} or mode.startswith("custom-") else "auto"
 
@@ -447,12 +567,17 @@ def read_fan_curve() -> list[list[int]]:
     if not path.is_file():
         return []
     try:
-        data = json.loads(path.read_text())
+        with open(path, "rb") as fh:
+            data = json.loads(fh.read(256 * 1024))
         if isinstance(data, list) and all(isinstance(p, list) and len(p) == 2 for p in data):
-            return [[int(p[0]), int(p[1])] for p in data]
+            return [[int(p[0]), int(p[1])] for p in data][:64]
     except (OSError, ValueError):
         pass
     return []
+
+
+def _clip(value: Any, limit: int = MAX_STR) -> str:
+    return str(value)[:limit]
 
 
 def collect(sample_seconds: float = SAMPLE_SECONDS) -> dict[str, Any]:
@@ -464,15 +589,15 @@ def collect(sample_seconds: float = SAMPLE_SECONDS) -> dict[str, Any]:
     # If nvidia gave a temp, prefer it for the GPU temp field; otherwise use the one we had
     return {
         "ok": True,
-        "cpu_name": cpu_name(),
+        "cpu_name": _clip(cpu_name()),
         "cpu_load": read_cpu_load(sample_seconds=sample_seconds),
-        "cpu_cores": read_cpu_cores(),
-        "cpu_temp": cpu_temp,
-        "gpu_name": gpu_name,
+        "cpu_cores": read_cpu_cores()[:MAX_LIST],
+        "cpu_temp": _clip(cpu_temp, 16),
+        "gpu_name": _clip(gpu_name),
         "gpu_load": gpu_load if gpu_load is not None else -1,
-        "gpu_temp": gpu_temp,
-        "nvme_temp": nvme_temp(devices),
-        "ram_info": ram_info(),
+        "gpu_temp": _clip(gpu_temp, 16),
+        "nvme_temp": _clip(nvme_temp(devices), 16),
+        "ram_info": _clip(ram_info()),
         "mem_pct": mem["pct"],
         "mem_used": f"{mem['used'] / (1024 ** 3):.1f}",
         "mem_avail": f"{mem['available'] / (1024 ** 3):.1f}",
@@ -480,19 +605,23 @@ def collect(sample_seconds: float = SAMPLE_SECONDS) -> dict[str, Any]:
         "swap_used": f"{mem['swap_used'] / (1024 ** 3):.1f}",
         "swap_total": f"{mem['swap_total'] / (1024 ** 3):.1f}",
         "swap_pct": mem["swap_pct"],
-        "disks": disk_usage(),
+        "disks": disk_usage()[:MAX_LIST],
         "fan1_rpm": fan1_rpm,
         "fan2_rpm": fan2_rpm,
         "fan_mode": read_fan_mode(),
         "fan_curve": read_fan_curve(),
         "fan_control": (Path(__file__).parent / "omarchy-fan-set").is_file(),
-        "top_mem": top_mem(),
-        "top_cpu": top_cpu(),
+        "top_mem": top_mem()[:MAX_LIST],
+        "top_cpu": top_cpu()[:MAX_LIST],
     }
 
 
 def main() -> int:
-    print(json.dumps(collect()))
+    # Hard wall-clock deadline: never let a stuck sensor or tool pin the job.
+    signal.signal(signal.SIGALRM, lambda *_: os._exit(124))
+    signal.alarm(JOB_DEADLINE_S)
+    out = json.dumps(collect())
+    sys.stdout.write(out[:MAX_OUT_BYTES] + "\n")
     return 0
 
 
