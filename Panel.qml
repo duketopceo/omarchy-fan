@@ -52,11 +52,22 @@ Panel {
     return p
   }
 
+  // Absolute interpreter: a PATH-preceding shadow "python3" must never run
+  // inside this long-lived shell process.
+  readonly property string py: "/usr/bin/python3"
+  readonly property var procEnv: ({
+    "PATH": "/usr/bin:/bin",
+    "HOME": null,
+    "XDG_RUNTIME_DIR": null,
+    "LANG": null,
+    "LC_ALL": "C"
+  })
+
   function setMode(mode) {
     if (!mode || !root.fanControl)
       return
     currentMode = mode
-    Quickshell.execDetached(["python3", root.pluginRoot + "/bin/omarchy-fan-set", mode])
+    Quickshell.execDetached([root.py, root.pluginRoot + "/bin/omarchy-fan-set", mode])
     refreshTimer.restart()
   }
 
@@ -65,7 +76,7 @@ Panel {
       return
     currentMode = "custom"
     customName = name
-    Quickshell.execDetached(["python3", root.pluginRoot + "/bin/omarchy-fan-set", "custom", name])
+    Quickshell.execDetached([root.py, root.pluginRoot + "/bin/omarchy-fan-set", "custom", name])
     refreshTimer.restart()
   }
 
@@ -87,7 +98,7 @@ Panel {
   function killProcess(pid) {
     if (!pid || pid <= 1)
       return
-    Quickshell.execDetached(["python3", root.pluginRoot + "/bin/kill_proc.py", pid.toString()])
+    Quickshell.execDetached([root.py, root.pluginRoot + "/bin/kill_proc.py", pid.toString()])
     refreshTimer.restart()
   }
 
@@ -95,6 +106,7 @@ Panel {
     if (!statusProc.running) {
       root.isRefreshing = true
       statusProc.running = true
+      statusDeadline.restart()
     }
   }
 
@@ -139,14 +151,21 @@ Panel {
 
   Process {
     id: statusProc
-    command: ["python3", root.pluginRoot + "/bin/system_monitor_stats.py"]
+    command: [root.py, root.pluginRoot + "/bin/system_monitor_stats.py"]
+    clearEnvironment: true
+    environment: root.procEnv
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
+        statusDeadline.stop()
         root.isRefreshing = false
         try {
           if (!text || text.trim().length === 0) {
             root.fetchError = "empty stats"
+            return
+          }
+          if (text.length > 300000) {
+            root.fetchError = "oversized stats payload"
             return
           }
           var data = JSON.parse(text)
@@ -207,6 +226,24 @@ Panel {
         } catch (e) {
           root.fetchError = "bad stats json"
         }
+      }
+    }
+    onExited: {
+      statusDeadline.stop()
+      root.isRefreshing = false
+    }
+  }
+
+  // Hard whole-job deadline: a stuck collector is killed and reaped, never
+  // left running past one refresh interval.
+  Timer {
+    id: statusDeadline
+    interval: 9000
+    onTriggered: {
+      if (statusProc.running) {
+        statusProc.signal(9)
+        root.isRefreshing = false
+        root.fetchError = "stats timeout"
       }
     }
   }

@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3
 """Kill a user process by pid. Refuses pid <= 1."""
 
 from __future__ import annotations

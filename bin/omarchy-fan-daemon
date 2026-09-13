@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3
 """Omarchy Fan Daemon: auto-curve, fixed presets, and a custom temperature curve."""
 
 from __future__ import annotations
