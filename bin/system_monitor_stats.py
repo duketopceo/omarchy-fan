@@ -133,25 +133,8 @@ def _read_proc_stat() -> dict[str, tuple[int, int]]:
     return stats
 
 
-def read_cpu_load(sample_seconds: float = SAMPLE_SECONDS) -> int:
-    s1 = _read_proc_stat().get("cpu")
-    if s1 is None:
-        return 0
-    if sample_seconds > 0:
-        time.sleep(sample_seconds)
-        s2 = _read_proc_stat().get("cpu")
-    else:
-        s2 = s1
-    if s2 is None:
-        return 0
-    dtotal = s2[0] - s1[0]
-    didle = s2[1] - s1[1]
-    if dtotal <= 0:
-        return 0
-    return round(100 * (1 - didle / dtotal))
-
-
-def read_cpu_cores(sample_seconds: float = SAMPLE_SECONDS) -> list[dict[str, int]]:
+def _read_cpu_stats(sample_seconds: float = SAMPLE_SECONDS) -> tuple[int, list[dict[str, int]]]:
+    """Sample /proc/stat once to compute both overall CPU load and per-core percentages."""
     s1 = _read_proc_stat()
     if sample_seconds > 0:
         time.sleep(sample_seconds)
@@ -159,6 +142,16 @@ def read_cpu_cores(sample_seconds: float = SAMPLE_SECONDS) -> list[dict[str, int
     else:
         s2 = s1.copy()
 
+    # Overall CPU load
+    cpu_load = 0
+    c1, c2 = s1.get("cpu"), s2.get("cpu")
+    if c1 and c2:
+        dt = c2[0] - c1[0]
+        di = c2[1] - c1[1]
+        if dt > 0:
+            cpu_load = round(100 * (1 - di / dt))
+
+    # Per-core breakdown
     cores: list[dict[str, int]] = []
     labels = [k for k in s2 if k.startswith("cpu") and k != "cpu" and k[3:].isdigit()]
     labels.sort(key=lambda x: int(x[3:]))
@@ -171,10 +164,24 @@ def read_cpu_cores(sample_seconds: float = SAMPLE_SECONDS) -> list[dict[str, int
             continue
         pct = round(100 * (1 - didle / dtotal))
         cores.append({"core": int(label[3:]), "percent": max(0, min(100, pct))})
-    return cores
 
+    return cpu_load, cores
+
+
+def read_cpu_load(sample_seconds: float = SAMPLE_SECONDS) -> int:
+    return _read_cpu_stats(sample_seconds)[0]
+
+
+def read_cpu_cores(sample_seconds: float = SAMPLE_SECONDS) -> list[dict[str, int]]:
+    return _read_cpu_stats(sample_seconds)[1]
+
+
+_CACHED_CPU_NAME: str | None = None
 
 def cpu_name() -> str:
+    global _CACHED_CPU_NAME
+    if _CACHED_CPU_NAME is not None:
+        return _CACHED_CPU_NAME
     try:
         with open("/proc/cpuinfo") as fh:
             for line in fh:
@@ -184,11 +191,12 @@ def cpu_name() -> str:
                     name = re.sub(r"\(R\)|\(TM\)|\(tm\)|\(r\)", "", name, flags=re.I)
                     name = re.sub(r"\s*CPU\s*@\s*[\d.]+\s*GHz", "", name, flags=re.I)
                     name = re.sub(r"\d+-Core Processor.*", "", name, flags=re.I)
-                    name = name.replace("Processor", "").strip(" ,")
-                    return " ".join(name.split()) or "CPU"
+                    _CACHED_CPU_NAME = " ".join(name.split()) or "CPU"
+                    return _CACHED_CPU_NAME
     except OSError:
         pass
-    return "CPU"
+    _CACHED_CPU_NAME = "CPU"
+    return _CACHED_CPU_NAME
 
 
 def read_meminfo(meminfo_path: Path | None = None) -> dict[str, Any]:
@@ -323,6 +331,20 @@ def cpu_temp_and_fans(devices: dict[str, Path] | None = None) -> tuple[str, int,
         fan2_rpm = _read_fan_input(ddv / "fan2_input")
         return cpu_temp, fan1_rpm, fan2_rpm
 
+    # Apple Silicon SMC (Asahi Linux macsmc_hwmon)
+    macsmc = devices.get("macsmc_hwmon")
+    if macsmc:
+        fan1_rpm = _read_fan_input(macsmc / "fan1_input")
+        fan2_rpm = _read_fan_input(macsmc / "fan2_input")
+        temps = []
+        for tfile in macsmc.glob("temp*_input"):
+            val = _milli_c_int(tfile)
+            if val is not None and 10 <= val <= 115:
+                temps.append(val)
+        if temps:
+            cpu_temp = f"{max(temps)}°C"
+        return cpu_temp, fan1_rpm, fan2_rpm
+
     # Common laptop/CPU temp sensors
     for name in ("coretemp", "k10temp", "zenpower"):
         path = devices.get(name)
@@ -410,6 +432,11 @@ def gpu_info() -> tuple[str, int | None, str]:
     except (OSError, ValueError):
         pass
 
+    # Apple Silicon AGX GPU
+    if Path("/sys/devices/platform/soc/406400000.gpu").is_dir() or Path("/sys/bus/platform/drivers/apple-agx").is_dir():
+        gpu_name = "Apple M1 Pro GPU"
+        return gpu_name, None, gpu_temp
+
     # Fallback to just a name and no load/temp
     gpu_name = _gpu_name_from_lspci() or "GPU"
     return gpu_name, gpu_load, gpu_temp
@@ -444,21 +471,30 @@ def _gpu_name_from_lspci() -> str | None:
     return None
 
 
+_CACHED_RAM_INFO: str | None = None
+
 def ram_info() -> str:
-    """Try to produce a short RAM type + speed label."""
+    """Try to produce a short RAM type + speed label (cached after first run)."""
+    global _CACHED_RAM_INFO
+    if _CACHED_RAM_INFO is not None:
+        return _CACHED_RAM_INFO
+
     inxi = _tool("inxi")
     out = _run([inxi, "-m", "-c0"], timeout=2) if inxi else None
     if out:
         # Look for Memory: ... type: DDR4 ... speed: 3200 MT/s
         m = re.search(r"type:\s*([^\s,]+).*?speed:\s*([^\s,]+)\s*MT/s", out, re.I | re.S)
         if m:
-            return f"{m.group(1).strip()} {m.group(2).strip()} MT/s"
+            _CACHED_RAM_INFO = f"{m.group(1).strip()} {m.group(2).strip()} MT/s"
+            return _CACHED_RAM_INFO
     # dmidecode usually needs root, but try in case it works
     dmidecode = _tool("dmidecode")
     if not dmidecode:
+        _CACHED_RAM_INFO = ""
         return ""
     out = _run([dmidecode, "-t", "memory"], timeout=1)
     if out is None:
+        _CACHED_RAM_INFO = ""
         return ""
     types: set[str] = set()
     speeds: set[str] = set()
@@ -479,10 +515,12 @@ def ram_info() -> str:
             k, v = line.split(":", 1)
             block[k.strip()] = v.strip()
     if types and speeds:
-        return f"{'/'.join(sorted(types))} {'/'.join(sorted(speeds))} MT/s"
-    if types:
-        return "/".join(sorted(types))
-    return ""
+        _CACHED_RAM_INFO = f"{'/'.join(sorted(types))} {'/'.join(sorted(speeds))} MT/s"
+    elif types:
+        _CACHED_RAM_INFO = "/".join(sorted(types))
+    else:
+        _CACHED_RAM_INFO = ""
+    return _CACHED_RAM_INFO
 
 
 ALLOWED_FS = {
@@ -586,12 +624,14 @@ def collect(sample_seconds: float = SAMPLE_SECONDS) -> dict[str, Any]:
     cpu_temp, fan1_rpm, fan2_rpm = cpu_temp_and_fans(devices)
     gpu_name, gpu_load, gpu_temp = gpu_info()
 
+    cpu_load, cpu_cores = _read_cpu_stats(sample_seconds=sample_seconds)
+
     # If nvidia gave a temp, prefer it for the GPU temp field; otherwise use the one we had
     return {
         "ok": True,
         "cpu_name": _clip(cpu_name()),
-        "cpu_load": read_cpu_load(sample_seconds=sample_seconds),
-        "cpu_cores": read_cpu_cores()[:MAX_LIST],
+        "cpu_load": cpu_load,
+        "cpu_cores": cpu_cores[:MAX_LIST],
         "cpu_temp": _clip(cpu_temp, 16),
         "gpu_name": _clip(gpu_name),
         "gpu_load": gpu_load if gpu_load is not None else -1,
