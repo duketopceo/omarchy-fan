@@ -102,6 +102,13 @@ Panel {
     refreshTimer.restart()
   }
 
+  // Cap + normalize collector-provided strings before they reach Text sinks:
+  // process names and mount paths are locally controlled and must never carry
+  // markup or runaway length into the persistent shell.
+  function clipStr(v, n) {
+    return String(v == null ? "" : v).replace(/[\x00-\x1f\x7f-\x9f<>]/g, " ").slice(0, n || 80)
+  }
+
   function refresh() {
     if (!statusProc.running) {
       root.isRefreshing = true
@@ -175,9 +182,9 @@ Panel {
           }
           root.fetchError = ""
           if (data.fan_mode)
-            root.currentMode = String(data.fan_mode).trim()
+            root.currentMode = clipStr(data.fan_mode, 24).trim()
           if (data.cpu_name)
-            root.cpuName = String(data.cpu_name)
+            root.cpuName = clipStr(data.cpu_name)
           if (data.cpu_load !== undefined)
             root.cpuLoad = Math.max(0, Math.min(100, parseInt(data.cpu_load) || 0))
           if (Array.isArray(data.cpu_cores))
@@ -185,39 +192,45 @@ Panel {
           if (data.mem_pct !== undefined)
             root.memPct = Math.max(0, Math.min(100, parseInt(data.mem_pct) || 0))
           if (data.mem_used)
-            root.memUsed = String(data.mem_used)
+            root.memUsed = clipStr(data.mem_used, 24)
           if (data.mem_avail)
-            root.memAvail = String(data.mem_avail)
+            root.memAvail = clipStr(data.mem_avail, 24)
           if (data.mem_total)
-            root.memTotal = String(data.mem_total)
+            root.memTotal = clipStr(data.mem_total, 24)
           if (data.swap_used)
-            root.swapUsed = String(data.swap_used)
+            root.swapUsed = clipStr(data.swap_used, 24)
           if (data.swap_total)
-            root.swapTotal = String(data.swap_total)
+            root.swapTotal = clipStr(data.swap_total, 24)
           if (data.swap_pct !== undefined)
             root.swapPct = Math.max(0, Math.min(100, parseInt(data.swap_pct) || 0))
           if (data.ram_info)
-            root.ramInfo = String(data.ram_info)
+            root.ramInfo = clipStr(data.ram_info)
           if (data.cpu_temp)
-            root.cpuTemp = String(data.cpu_temp)
+            root.cpuTemp = clipStr(data.cpu_temp, 16)
           if (data.gpu_name)
-            root.gpuName = String(data.gpu_name)
+            root.gpuName = clipStr(data.gpu_name)
           if (data.gpu_load !== undefined) {
             var gl = parseInt(data.gpu_load)
             root.gpuLoad = isNaN(gl) ? -1 : Math.max(0, Math.min(100, gl))
           }
           if (data.gpu_temp)
-            root.gpuTemp = String(data.gpu_temp)
+            root.gpuTemp = clipStr(data.gpu_temp, 16)
           if (data.nvme_temp)
-            root.nvmeTemp = String(data.nvme_temp)
+            root.nvmeTemp = clipStr(data.nvme_temp, 16)
           if (data.fan1_rpm !== undefined)
             root.fan1Rpm = parseInt(data.fan1_rpm) || 0
           if (data.fan2_rpm !== undefined)
             root.fan2Rpm = parseInt(data.fan2_rpm) || 0
           if (Array.isArray(data.top_mem))
-            root.topMem = data.top_mem
+            root.topMem = data.top_mem.slice(0, 32).map(function(p) {
+              p.name = clipStr(p.name, 48)
+              return p
+            })
           if (Array.isArray(data.disks))
-            root.disks = data.disks
+            root.disks = data.disks.slice(0, 24).map(function(d) {
+              d.mount = clipStr(d.mount, 64)
+              return d
+            })
           if (Array.isArray(data.fan_curve))
             root.fanCurve = data.fan_curve
           root.fanControl = !!data.fan_control
@@ -323,6 +336,7 @@ Panel {
         Text {
           visible: root.fetchError.length > 0
           text: root.fetchError
+          textFormat: Text.PlainText
           color: root.urgent
           font.pixelSize: Style.font.bodySmall
         }
@@ -337,6 +351,7 @@ Panel {
             id: modeLabel
             anchors.centerIn: parent
             text: root.fanControl ? (root.currentMode === "custom" ? root.customName.toUpperCase() : root.currentMode.toUpperCase()) : "READ"
+            textFormat: Text.PlainText
             color: Color.background
             font.pixelSize: Style.font.bodySmall
             font.bold: true
@@ -357,6 +372,7 @@ Panel {
         spacing: Style.space(6)
         Text {
           text: root.cpuName
+          textFormat: Text.PlainText
           color: root.fg
           font.family: root.bar ? root.bar.fontFamily : Style.font.family
           font.pixelSize: Style.font.bodySmall
@@ -376,6 +392,7 @@ Panel {
           }
           Text {
             text: root.cpuTemp
+            textFormat: Text.PlainText
             color: root.tempColor(root.cpuTemp)
             font.family: root.bar ? root.bar.fontFamily : Style.font.family
             font.pixelSize: Style.font.bodySmall
@@ -403,6 +420,7 @@ Panel {
         spacing: Style.space(6)
         Text {
           text: root.cpuCores.length + " CORES"
+          textFormat: Text.PlainText
           color: root.muted
           font.pixelSize: Style.font.bodySmall
           font.bold: true
@@ -464,6 +482,7 @@ Panel {
           }
           Text {
             text: root.memUsed + " / " + root.memTotal + " GB (" + root.memPct + "%)"
+            textFormat: Text.PlainText
             color: root.memColor()
             font.bold: true
             font.pixelSize: Style.font.bodySmall
@@ -499,6 +518,7 @@ Panel {
           width: parent.width
           Text {
             text: root.gpuName
+            textFormat: Text.PlainText
             color: root.fg
             font.bold: true
             font.pixelSize: Style.font.bodySmall
@@ -508,6 +528,7 @@ Panel {
           }
           Text {
             text: (root.gpuLoad >= 0 ? root.gpuLoad + "% " : "") + root.gpuTemp
+            textFormat: Text.PlainText
             color: root.tempColor(root.gpuTemp)
             font.bold: true
             font.pixelSize: Style.font.bodySmall
@@ -557,6 +578,7 @@ Panel {
                 width: parent.width
                 Text {
                   text: modelData.mount
+                  textFormat: Text.PlainText
                   color: root.fg
                   font.pixelSize: Style.font.caption
                   font.bold: true
@@ -568,6 +590,7 @@ Panel {
                 }
                 Text {
                   text: modelData.used_gb + " / " + modelData.total_gb + "G (" + modelData.percent + "%)"
+                  textFormat: Text.PlainText
                   color: root.levelColor(modelData.percent, 80, 95)
                   font.pixelSize: Style.font.caption
                 }
@@ -617,6 +640,7 @@ Panel {
               Text {
                 anchors.centerIn: parent
                 text: modelData === "auto" ? "Auto" : (modelData === "low" ? "Low" : (modelData === "med" ? "Med" : (modelData === "high" ? "High" : "Cust")))
+                textFormat: Text.PlainText
                 color: root.currentMode === modelData ? Color.background : root.fg
                 font.bold: true
                 font.pixelSize: Style.font.caption
@@ -648,6 +672,7 @@ Panel {
               Text {
                 anchors.centerIn: parent
                 text: modelData.charAt(0).toUpperCase() + modelData.slice(1)
+                textFormat: Text.PlainText
                 color: root.customName === modelData ? Color.background : root.fg
                 font.bold: true
                 font.pixelSize: Style.font.caption
@@ -763,6 +788,7 @@ Panel {
               anchors.rightMargin: Style.space(4)
               Text {
                 text: modelData.name || "unknown"
+                textFormat: Text.PlainText
                 color: root.fg
                 font.bold: true
                 font.pixelSize: Style.font.bodySmall
@@ -779,6 +805,7 @@ Panel {
               }
               Text {
                 text: (modelData.mem_mb || 0) + " MB"
+                textFormat: Text.PlainText
                 color: root.fg
                 font.pixelSize: Style.font.bodySmall
               }

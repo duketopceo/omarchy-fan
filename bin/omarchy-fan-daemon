@@ -56,8 +56,6 @@ def mode_path() -> Path:
     if user_modes:
         user_modes.sort(key=lambda p: os.path.getmtime(p), reverse=True)
         return Path(user_modes[0])
-    if Path("/tmp/current_fan_mode").is_file():
-        return Path("/tmp/current_fan_mode")
     return runtime_dir() / "current_fan_mode"
 
 
