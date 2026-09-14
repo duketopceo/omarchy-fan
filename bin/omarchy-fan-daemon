@@ -7,6 +7,7 @@ import glob
 import json
 import os
 import stat
+import sys
 import time
 from pathlib import Path
 
@@ -21,42 +22,25 @@ DEFAULT_CURVE = [
 ]
 
 
-def config_home() -> Path:
-    env = os.environ.get("XDG_CONFIG_HOME")
+def target_uid() -> int:
+    """Explicit target UID: via --uid arg, OMARCHY_FAN_UID env, SUDO_UID env, or current UID."""
+    for i, arg in enumerate(sys.argv[:-1]):
+        if arg == "--uid":
+            try:
+                return int(sys.argv[i + 1])
+            except ValueError:
+                pass
+    env = os.environ.get("OMARCHY_FAN_UID") or os.environ.get("SUDO_UID")
     if env:
-        return Path(env)
-    return Path.home() / ".config"
-
-
-def curve_path() -> Path:
-    base = config_home() / "omarchy" / "fan_curve.json"
-    if base.is_file():
-        return base
-    for u in glob.glob("/home/*/.config/omarchy/fan_curve.json"):
-        if os.path.isfile(u):
-            return Path(u)
-    return base
-
-
-def runtime_dir() -> Path:
-    base = os.environ.get("XDG_RUNTIME_DIR")
-    if not base:
-        base = os.path.join(os.path.expanduser("~"), ".local", "run")
-    d = Path(base) / "omarchy-fan"
-    d.mkdir(parents=True, exist_ok=True, mode=0o700)
-    try:
-        os.chmod(d, 0o700)
-    except OSError:
-        pass
-    return d
-
-
-def mode_path() -> Path:
-    user_modes = glob.glob("/run/user/*/omarchy-fan/current_fan_mode")
-    if user_modes:
-        user_modes.sort(key=lambda p: os.path.getmtime(p), reverse=True)
-        return Path(user_modes[0])
-    return runtime_dir() / "current_fan_mode"
+        try:
+            return int(env)
+        except ValueError:
+            pass
+    uid = os.getuid()
+    if uid != 0:
+        return uid
+    # When running as root, bind to the primary interactive user (UID 1000)
+    return 1000
 
 
 def get_hwmon() -> tuple[str, Path | None]:
@@ -191,36 +175,84 @@ def set_fan_speed(hw_type: str, hwmon: Path | None, pwm_val: int) -> None:
                 pass
 
 
-def get_requested_mode() -> str:
-    path = mode_path()
-    if not path.is_file():
-        return "auto"
+def get_requested_mode(uid: int | None = None) -> str:
+    if uid is None:
+        uid = target_uid()
+    rdir = Path(f"/run/user/{uid}/omarchy-fan")
+    if not rdir.is_dir():
+        try:
+            import pwd
+            home = Path(pwd.getpwuid(uid).pw_dir)
+            rdir = home / ".local" / "run" / "omarchy-fan"
+        except (KeyError, ImportError):
+            pass
+
     try:
-        # Open with O_NOFOLLOW to avoid following a symlink placed by another user.
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
-        st = os.fstat(fd)
-        if not stat.S_ISREG(st.st_mode) or (os.getuid() != 0 and st.st_uid != os.getuid()):
-            os.close(fd)
-            return "auto"
-        with os.fdopen(fd, "r") as fh:
-            mode = fh.read().strip().lower()
-        if mode in {"auto", "low", "med", "high", "custom"} or mode.startswith("custom-"):
-            return mode
+        dfd = os.open(rdir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     except OSError:
-        pass
+        return "auto"
+
+    try:
+        dst = os.fstat(dfd)
+        if not stat.S_ISDIR(dst.st_mode) or dst.st_uid != uid:
+            return "auto"
+        try:
+            ffd = os.open("current_fan_mode", os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dfd)
+        except OSError:
+            return "auto"
+        try:
+            fst = os.fstat(ffd)
+            if not stat.S_ISREG(fst.st_mode) or fst.st_uid != uid or fst.st_size > 64:
+                return "auto"
+            data = os.read(ffd, 64).decode("utf-8", errors="replace").strip().lower()
+            if data in {"auto", "low", "med", "high", "custom"} or data.startswith("custom-"):
+                return data
+        finally:
+            os.close(ffd)
+    finally:
+        os.close(dfd)
+
     return "auto"
 
 
-def load_curve() -> list[list[int]]:
-    path = curve_path()
-    if not path.is_file():
-        return DEFAULT_CURVE
+def load_curve(uid: int | None = None) -> list[list[int]]:
+    if uid is None:
+        uid = target_uid()
     try:
-        data = json.loads(path.read_text())
-        if isinstance(data, list) and all(isinstance(p, list) and len(p) == 2 for p in data):
-            return [[int(p[0]), int(p[1])] for p in data]
-    except (OSError, ValueError):
-        pass
+        import pwd
+        home = Path(pwd.getpwuid(uid).pw_dir)
+        cdir = home / ".config" / "omarchy"
+    except (KeyError, ImportError):
+        return DEFAULT_CURVE
+
+    try:
+        dfd = os.open(cdir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError:
+        return DEFAULT_CURVE
+
+    try:
+        dst = os.fstat(dfd)
+        if not stat.S_ISDIR(dst.st_mode) or dst.st_uid != uid:
+            return DEFAULT_CURVE
+        try:
+            ffd = os.open("fan_curve.json", os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dfd)
+        except OSError:
+            return DEFAULT_CURVE
+        try:
+            fst = os.fstat(ffd)
+            if not stat.S_ISREG(fst.st_mode) or fst.st_uid != uid or fst.st_size > 65536:
+                return DEFAULT_CURVE
+            raw = os.read(ffd, 65536).decode("utf-8", errors="replace")
+            data = json.loads(raw)
+            if isinstance(data, list) and all(isinstance(p, list) and len(p) == 2 for p in data):
+                return [[int(p[0]), int(p[1])] for p in data]
+        except (OSError, ValueError):
+            pass
+        finally:
+            os.close(ffd)
+    finally:
+        os.close(dfd)
+
     return DEFAULT_CURVE
 
 
@@ -246,8 +278,9 @@ def curve_pwm(temp: int, curve: list[list[int]]) -> int:
 
 def main() -> None:
     hw_type, hwmon = get_hwmon()
+    uid = target_uid()
     while True:
-        mode = get_requested_mode()
+        mode = get_requested_mode(uid)
         temp = get_max_temp()
         on_ac = is_on_ac()
 
@@ -289,7 +322,7 @@ def main() -> None:
             set_fan_speed(hw_type, hwmon, 255)
 
         elif mode == "custom" or mode.startswith("custom-"):
-            curve = load_curve()
+            curve = load_curve(uid)
             pwm = curve_pwm(temp, curve)
             if temp >= 65:
                 set_platform_profile("cool")
