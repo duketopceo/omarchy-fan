@@ -16,7 +16,29 @@ omarchy plugin enable lukedaduke.fan
 - Laptop fan RPM readout
 - Top memory/CPU processes with `j`/`k` selection and kill support
 - Fan modes: auto, low, medium, high, plus a user-editable custom curve
-- `omarchy-fan-daemon` runs the auto curve and writes to `/sys/class/thermal` cooling devices
+- `omarchy-fan-daemon` runs the auto/custom curves and drives fan hwmon (`fan*_target` on Apple Silicon `macsmc_hwmon`, `pwm*` on `dell_smm`)
+
+## Fan daemon setup
+
+Fan control is applied by `bin/omarchy-fan-daemon`, which must run as
+root to write `/sys/class/hwmon/*/fan*_target` / `pwm*`. The widget wires
+it for you: click **⚡ Start Daemon** in the panel (or just pick a fan
+mode — the first change auto-starts it). That runs
+`bin/omarchy-fan-daemon-start` via `pkexec`, which installs the shipped
+`omarchy-fan-daemon.service` into `/etc/systemd/system/` and starts it.
+
+To install it by hand instead:
+
+```bash
+pkexec ~/.config/omarchy/plugins/lukedaduke.fan/bin/omarchy-fan-daemon-start
+```
+
+The daemon polls `$XDG_RUNTIME_DIR/omarchy-fan/current_fan_mode`
+(written by `bin/omarchy-fan-set`) every 2 s and applies the matching
+curve/preset. On hardware with no daemon-driveable fan (no
+`macsmc_hwmon`/`dell_smm` fan targets) and no running daemon, the widget
+degrades to read-only honestly: stats and fan RPM still render, the mode
+badge shows `READ`, and the preset buttons are disabled.
 
 ## Usage
 
@@ -31,8 +53,12 @@ The custom curve is editable from the panel when the daemon is running.
 
 ## Requirements
 
+- `python3` (all helpers are Python; the panel execs `/usr/bin/python3`)
 - A Linux laptop with `hwmon` thermal/fan sensors
-- `nbfc` or compatible `cooling_device*` files for the fan daemon to write to (auto mode works without them)
+- For fan control: `macsmc_hwmon` (Apple Silicon) or `dell_smm` fan
+  targets plus `pkexec` to install/start the daemon (see above)
+- Optional: `btop` + `omarchy-launch-or-focus-tui` for the middle-click
+  launcher
 
 ## License
 

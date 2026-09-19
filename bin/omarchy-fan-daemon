@@ -21,6 +21,17 @@ DEFAULT_CURVE = [
     [75, 255],
 ]
 
+# God-to-great auto curve: aggressively keeps temperatures in low 50s and below
+AUTO_CURVE = [
+    [0, 0],
+    [36, 40],    # ~1500-1900 RPM whisper baseline
+    [40, 75],    # ~2200-2400 RPM gentle proactive cooling
+    [44, 120],   # ~2800-3000 RPM active thermal rejection
+    [48, 175],   # ~3400-3700 RPM aggressive ramp before 50°C
+    [51, 220],   # ~3900-4300 RPM high power to cap temperatures
+    [54, 255],   # 100% full blast to crush heat spikes
+]
+
 
 def target_uid() -> int:
     """Explicit target UID: via --uid arg, OMARCHY_FAN_UID env, SUDO_UID env, or current UID."""
@@ -39,8 +50,14 @@ def target_uid() -> int:
     uid = os.getuid()
     if uid != 0:
         return uid
-    # When running as root, bind to the primary interactive user (UID 1000)
-    return 1000
+    # When running as root, detect active user session from /run/user
+    try:
+        run_users = [int(p.name) for p in Path("/run/user").glob("[0-9]*") if p.is_dir() and int(p.name) >= 1000]
+        if run_users:
+            return sorted(run_users)[0]
+    except (OSError, ValueError):
+        pass
+    return 1001
 
 
 def get_hwmon() -> tuple[str, Path | None]:
@@ -151,7 +168,15 @@ def set_fan_speed(hw_type: str, hwmon: Path | None, pwm_val: int) -> None:
         target2 = round(f2_min + (f2_max - f2_min) * ratio)
 
         try:
+            os.chmod(hwmon / "fan1_target", 0o644)
+        except OSError:
+            pass
+        try:
             (hwmon / "fan1_target").write_text(str(target1))
+        except OSError:
+            pass
+        try:
+            os.chmod(hwmon / "fan2_target", 0o644)
         except OSError:
             pass
         try:
@@ -285,29 +310,15 @@ def main() -> None:
         on_ac = is_on_ac()
 
         if mode == "auto":
-            if hw_type == "macsmc":
-                set_fan_speed(hw_type, hwmon, 0)
+            # God-to-great auto curve: proactively cools to maintain low 50s and below
+            pwm = curve_pwm(temp, AUTO_CURVE)
+            if temp >= 52:
+                set_platform_profile("cool")
+            elif temp >= 45:
+                set_platform_profile("balanced")
             else:
-                if on_ac:
-                    if temp >= 58:
-                        set_platform_profile("cool")
-                        set_fan_speed(hw_type, hwmon, 255)
-                    elif temp >= 52:
-                        set_platform_profile("cool")
-                        set_fan_speed(hw_type, hwmon, 204)
-                    elif temp <= 48:
-                        set_platform_profile("balanced")
-                        set_fan_speed(hw_type, hwmon, 140)
-                else:
-                    if temp >= 65:
-                        set_platform_profile("cool")
-                        set_fan_speed(hw_type, hwmon, 230)
-                    elif temp >= 58:
-                        set_platform_profile("balanced")
-                        set_fan_speed(hw_type, hwmon, 170)
-                    elif temp <= 52:
-                        set_platform_profile("quiet")
-                        set_fan_speed(hw_type, hwmon, 100)
+                set_platform_profile("quiet")
+            set_fan_speed(hw_type, hwmon, pwm)
 
         elif mode == "low":
             set_platform_profile("quiet")

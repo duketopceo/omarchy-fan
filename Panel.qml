@@ -35,7 +35,11 @@ Panel {
   property var fanCurve: []
   property bool isRefreshing: false
   property string fetchError: ""
+  // Last stderr chunk from the stats helper — appended to fetchError when
+  // the process exits non-zero so a crash carries diagnostics.
+  property string statsStderr: ""
   property bool fanControl: false
+  property bool daemonRunning: false
   property int selectedProc: 0
 
   readonly property color fg: bar ? bar.foreground : Color.foreground
@@ -55,17 +59,29 @@ Panel {
   // Absolute interpreter: a PATH-preceding shadow "python3" must never run
   // inside this long-lived shell process.
   readonly property string py: "/usr/bin/python3"
+  // XDG_RUNTIME_DIR must survive the scrub: the collector resolves
+  // $XDG_RUNTIME_DIR/omarchy-fan/current_fan_mode — the same path
+  // omarchy-fan-set writes (full env) and the daemon reads. Scrubbing it
+  // makes the helper fall back to ~/.local/run, so fan_mode reads "auto"
+  // forever and the badge/presets/right-click cycling go dead.
   readonly property var procEnv: ({
     "PATH": "/usr/bin:/bin",
     "HOME": null,
-    "XDG_RUNTIME_DIR": null,
+    "XDG_RUNTIME_DIR": Quickshell.env("XDG_RUNTIME_DIR"),
     "LANG": null,
     "LC_ALL": "C"
   })
 
+  function triggerDaemon() {
+    Quickshell.execDetached(["pkexec", root.pluginRoot + "/bin/omarchy-fan-daemon-start"])
+    refreshTimer.restart()
+  }
+
   function setMode(mode) {
     if (!mode || !root.fanControl)
       return
+    if (!root.daemonRunning)
+      triggerDaemon()
     currentMode = mode
     Quickshell.execDetached([root.py, root.pluginRoot + "/bin/omarchy-fan-set", mode])
     refreshTimer.restart()
@@ -74,6 +90,8 @@ Panel {
   function setCustom(name) {
     if (!root.fanControl)
       return
+    if (!root.daemonRunning)
+      triggerDaemon()
     currentMode = "custom"
     customName = name
     Quickshell.execDetached([root.py, root.pluginRoot + "/bin/omarchy-fan-set", "custom", name])
@@ -234,6 +252,7 @@ Panel {
           if (Array.isArray(data.fan_curve))
             root.fanCurve = data.fan_curve
           root.fanControl = !!data.fan_control
+          root.daemonRunning = !!data.daemon_running
           if (root.selectedProc >= root.topMem.length)
             root.selectedProc = Math.max(0, root.topMem.length - 1)
         } catch (e) {
@@ -241,9 +260,25 @@ Panel {
         }
       }
     }
-    onExited: {
+    // A collector crash writes its traceback to stderr — collect it so a
+    // dead helper surfaces real diagnostics instead of a bare exit code.
+    stderr: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        var err = String(text || "").trim()
+        root.statsStderr = err.substring(0, 200)
+        if (err)
+          console.warn("system_monitor_stats stderr: " + err.substring(0, 500))
+      }
+    }
+    onExited: function (code) {
       statusDeadline.stop()
       root.isRefreshing = false
+      if (code !== 0 && root.fetchError.length === 0)
+        root.fetchError = root.statsStderr.length > 0
+          ? "stats helper failed: " + root.statsStderr
+          : "stats helper exited " + code
+      root.statsStderr = ""
     }
   }
 
@@ -618,10 +653,37 @@ Panel {
       Column {
         width: parent.width
         spacing: Style.space(8)
-        Text {
-          text: "Fans " + root.fan1Rpm + " / " + root.fan2Rpm + " RPM"
-          color: root.fg
-          font.pixelSize: Style.font.bodySmall
+        RowLayout {
+          width: parent.width
+          Text {
+            Layout.fillWidth: true
+            text: "Fans " + root.fan1Rpm + " / " + root.fan2Rpm + " RPM"
+            color: root.fg
+            font.pixelSize: Style.font.bodySmall
+          }
+          Rectangle {
+            id: daemonBtn
+            implicitWidth: daemonBtnText.implicitWidth + Style.space(16)
+            implicitHeight: Style.space(22)
+            radius: Style.space(4)
+            color: root.daemonRunning ? "transparent" : root.accent
+            border.color: root.daemonRunning ? root.fg : root.accent
+            border.width: 1
+            opacity: root.daemonRunning ? 0.7 : 1.0
+            Text {
+              id: daemonBtnText
+              anchors.centerIn: parent
+              text: root.daemonRunning ? "● Daemon Active" : "⚡ Start Daemon"
+              color: root.daemonRunning ? root.fg : Color.background
+              font.bold: true
+              font.pixelSize: Style.font.caption
+            }
+            MouseArea {
+              anchors.fill: parent
+              cursorShape: Qt.PointingHandCursor
+              onClicked: root.triggerDaemon()
+            }
+          }
         }
         Row {
           width: parent.width

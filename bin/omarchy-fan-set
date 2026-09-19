@@ -42,10 +42,8 @@ def runtime_dirfd() -> int:
     if not base:
         base = os.path.join(os.path.expanduser("~"), ".local", "run")
     target = os.path.join(base, "omarchy-fan")
-    try:
-        os.mkdir(target, 0o700)
-    except FileExistsError:
-        pass
+    # makedirs: the XDG-less fallback base (~/.local/run) may not exist yet.
+    os.makedirs(target, mode=0o700, exist_ok=True)
     fd = _open_dir(target)
     st = os.fstat(fd)
     if stat.S_IMODE(st.st_mode) != 0o700:
@@ -99,4 +97,10 @@ def main(argv: list[str]) -> None:
 
 
 if __name__ == "__main__":
-    main(sys.argv[1:])
+    try:
+        main(sys.argv[1:])
+    except OSError as exc:
+        # Fail closed with a clean non-zero exit, not a raw traceback —
+        # this helper is spawned detached, so nobody sees the trace anyway.
+        print(f"omarchy-fan-set: {exc}", file=sys.stderr)
+        raise SystemExit(1)

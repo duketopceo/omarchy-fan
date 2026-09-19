@@ -1,0 +1,75 @@
+#!/bin/bash
+set -e
+
+# Resolve script directory and target user
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PLUGIN_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+TARGET_UID="${OMARCHY_FAN_UID:-$(id -u)}"
+if [ "$TARGET_UID" -eq 0 ] && [ -n "$SUDO_UID" ]; then
+    TARGET_UID="$SUDO_UID"
+fi
+
+SERVICE_SRC="$PLUGIN_DIR/omarchy-fan-daemon.service"
+if [ ! -f "$SERVICE_SRC" ]; then
+    SERVICE_SRC="/home/lukekimball/.config/omarchy/omarchy-fan-daemon.service"
+fi
+SERVICE_DST="/etc/systemd/system/omarchy-fan-daemon.service"
+
+# Retrieve sudo password from OmaSeal keyring if available
+get_omaseal_password() {
+    if command -v omaseal >/dev/null 2>&1; then
+        for acc in "sudo" "system" "default" "root" "$USER"; do
+            pass=$(omaseal get system "$acc" 2>/dev/null || omaseal get sudo "$acc" 2>/dev/null || true)
+            if [ -n "$pass" ]; then
+                echo "$pass"
+                return 0
+            fi
+        done
+    fi
+    return 1
+}
+
+PASS=$(get_omaseal_password || true)
+
+run_elevated() {
+    if [ "$(id -u)" -eq 0 ]; then
+        "$@"
+    elif [ -n "$PASS" ]; then
+        echo "$PASS" | sudo -S "$@"
+    elif command -v pkexec >/dev/null 2>&1; then
+        pkexec "$@"
+    else
+        sudo "$@"
+    fi
+}
+
+# If running as unprivileged user, re-invoke ourselves through run_elevated
+if [ "$(id -u)" -ne 0 ]; then
+    run_elevated env OMARCHY_FAN_UID="$TARGET_UID" "$0" "$@"
+    exit $?
+fi
+
+# We are root:
+# 1. Update / install systemd service if available
+USER_HOME="${SUDO_USER:+$(getent passwd "$SUDO_USER" | cut -d: -f6)}"
+USER_HOME="${USER_HOME:-$HOME}"
+
+if [ -f "$SERVICE_SRC" ]; then
+    sed -e "s|%h|$USER_HOME|g" \
+        -e "s|ExecStart=.*|ExecStart=$PLUGIN_DIR/bin/omarchy-fan-daemon --uid $TARGET_UID|" \
+        -e "s|OMARCHY_FAN_UID=[0-9]*|OMARCHY_FAN_UID=$TARGET_UID|g" \
+        "$SERVICE_SRC" > "$SERVICE_DST"
+    # Ensure uid arg and env are present
+    if ! grep -q -- "--uid" "$SERVICE_DST"; then
+        sed -i "s|bin/omarchy-fan-daemon|bin/omarchy-fan-daemon --uid $TARGET_UID|" "$SERVICE_DST"
+    fi
+    if ! grep -q "OMARCHY_FAN_UID" "$SERVICE_DST"; then
+        sed -i "/Environment=/a Environment=\"OMARCHY_FAN_UID=$TARGET_UID\"" "$SERVICE_DST"
+    fi
+    systemctl daemon-reload
+    systemctl restart omarchy-fan-daemon.service
+    exit 0
+fi
+
+# 2. Fallback: exec daemon directly
+exec "$PLUGIN_DIR/bin/omarchy-fan-daemon" --uid "$TARGET_UID"

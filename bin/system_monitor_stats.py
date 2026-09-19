@@ -182,6 +182,26 @@ def cpu_name() -> str:
     global _CACHED_CPU_NAME
     if _CACHED_CPU_NAME is not None:
         return _CACHED_CPU_NAME
+
+    # 1. DeviceTree model (Apple Silicon, ARM boards)
+    dt_model = Path("/sys/firmware/devicetree/base/model")
+    if dt_model.is_file():
+        try:
+            raw = dt_model.read_bytes().replace(b"\x00", b"").decode("utf-8", errors="replace").strip()
+            m = re.search(r"Apple.*?\((?:[^,]+,\s*)?(M\d+(?:\s+(?:Pro|Max|Ultra))?)(?:,\s*\d+)?\)", raw, re.I)
+            if m:
+                _CACHED_CPU_NAME = f"Apple {m.group(1).strip()}"
+                return _CACHED_CPU_NAME
+            elif raw.startswith("Apple "):
+                _CACHED_CPU_NAME = raw.split("(")[0].strip()
+                return _CACHED_CPU_NAME
+            elif raw:
+                _CACHED_CPU_NAME = raw[:32]
+                return _CACHED_CPU_NAME
+        except OSError:
+            pass
+
+    # 2. /proc/cpuinfo
     try:
         with open("/proc/cpuinfo") as fh:
             for line in fh:
@@ -193,8 +213,25 @@ def cpu_name() -> str:
                     name = re.sub(r"\d+-Core Processor.*", "", name, flags=re.I)
                     _CACHED_CPU_NAME = " ".join(name.split()) or "CPU"
                     return _CACHED_CPU_NAME
+                elif line.startswith("Hardware") or line.startswith("Model"):
+                    name = line.split(":", 1)[1].strip()
+                    if name:
+                        _CACHED_CPU_NAME = name
+                        return _CACHED_CPU_NAME
     except OSError:
         pass
+
+    # 3. DMI product name
+    dmi = Path("/sys/devices/virtual/dmi/id/product_name")
+    if dmi.is_file():
+        try:
+            val = dmi.read_text().strip()
+            if val and val.lower() not in {"none", "system product name"}:
+                _CACHED_CPU_NAME = val[:32]
+                return _CACHED_CPU_NAME
+        except OSError:
+            pass
+
     _CACHED_CPU_NAME = "CPU"
     return _CACHED_CPU_NAME
 
@@ -370,13 +407,25 @@ def nvme_temp(devices: dict[str, Path] | None = None) -> str:
     if devices is None:
         devices = hwmon_paths()
     temps: list[int] = []
+
+    # 1. Apple Silicon macsmc NAND Flash temperature
+    macsmc = devices.get("macsmc_hwmon")
+    if macsmc:
+        for tf in macsmc.glob("temp*input"):
+            lf = macsmc / tf.name.replace("input", "label")
+            if lf.is_file() and "nand" in lf.read_text().lower():
+                val = _milli_c_int(tf)
+                if val is not None:
+                    return f"{val}°C"
+
+    # 2. Standard NVMe or drivetemp sensors
     for name, path in devices.items():
-        if name != "nvme":
-            continue
-        try:
-            temps.append(round(int((path / "temp1_input").read_text().strip()) / 1000))
-        except (OSError, ValueError):
-            continue
+        if "nvme" in name.lower() or "drivetemp" in name.lower():
+            for tf in path.glob("temp*input"):
+                val = _milli_c_int(tf)
+                if val is not None and 0 <= val <= 110:
+                    temps.append(val)
+
     if not temps:
         return "--"
     return f"{max(temps)}°C"
@@ -388,7 +437,7 @@ def gpu_info() -> tuple[str, int | None, str]:
     gpu_load: int | None = None
     gpu_temp = "--"
 
-    # NVIDIA
+    # 1. NVIDIA
     nvidia = _tool("nvidia-smi")
     if nvidia and Path("/proc/driver/nvidia/version").is_file():
         out_text = _run(
@@ -412,7 +461,7 @@ def gpu_info() -> tuple[str, int | None, str]:
         except (ValueError, IndexError):
             pass
 
-    # AMD gpu_busy_percent
+    # 2. AMD gpu_busy_percent
     try:
         for f in Path("/sys/class/drm").glob("card*/device/gpu_busy_percent"):
             if not f.is_file():
@@ -420,7 +469,6 @@ def gpu_info() -> tuple[str, int | None, str]:
             v = f.read_text().strip()
             if v:
                 gpu_load = max(0, min(100, round(float(v))))
-                # temp alongside
                 temp_path = f.parent / "hwmon" / "hwmon*" / "temp1_input"
                 for tp in f.parent.glob("hwmon/hwmon*/temp1_input"):
                     t = _milli_c(tp)
@@ -432,12 +480,16 @@ def gpu_info() -> tuple[str, int | None, str]:
     except (OSError, ValueError):
         pass
 
-    # Apple Silicon AGX GPU
+    # 3. Apple Silicon AGX GPU (autodetected from SoC chip model)
     if Path("/sys/devices/platform/soc/406400000.gpu").is_dir() or Path("/sys/bus/platform/drivers/apple-agx").is_dir():
-        gpu_name = "Apple M1 Pro GPU"
-        return gpu_name, None, gpu_temp
+        c_name = cpu_name()
+        gpu_name = f"{c_name} GPU" if "Apple" in c_name else "Apple Silicon GPU"
+        # On Apple Silicon unified SoC, die temp is shared
+        devices = hwmon_paths()
+        cpu_t, _, _ = cpu_temp_and_fans(devices)
+        return gpu_name, None, cpu_t
 
-    # Fallback to just a name and no load/temp
+    # 4. Fallback to lspci
     gpu_name = _gpu_name_from_lspci() or "GPU"
     return gpu_name, gpu_load, gpu_temp
 
@@ -487,6 +539,13 @@ def ram_info() -> str:
         if m:
             _CACHED_RAM_INFO = f"{m.group(1).strip()} {m.group(2).strip()} MT/s"
             return _CACHED_RAM_INFO
+
+    # Apple Silicon DeviceTree check
+    dt_model = Path("/sys/firmware/devicetree/base/model")
+    if dt_model.is_file() and b"Apple" in dt_model.read_bytes():
+        _CACHED_RAM_INFO = "LPDDR5 Unified"
+        return _CACHED_RAM_INFO
+
     # dmidecode usually needs root, but try in case it works
     dmidecode = _tool("dmidecode")
     if not dmidecode:
@@ -614,6 +673,36 @@ def read_fan_curve() -> list[list[int]]:
     return []
 
 
+def _has_controllable_fan(devices: dict[str, Path] | None = None) -> bool:
+    """True when hwmon exposes fan-control nodes the daemon can drive.
+
+    The daemon only speaks macsmc (fan*_target) and dell_smm (pwm*);
+    any other sensor means mode writes are dead drops.
+    """
+    if devices is None:
+        devices = hwmon_paths()
+    macsmc = devices.get("macsmc_hwmon")
+    if macsmc and macsmc.is_dir() and any(macsmc.glob("fan*_target")):
+        return True
+    dell = devices.get("dell_smm")
+    if dell and dell.is_dir() and any(dell.glob("pwm[0-9]*")):
+        return True
+    return False
+
+
+def fan_control_available(devices: dict[str, Path] | None = None) -> bool:
+    """Honest fan-control capability for the panel.
+
+    The mode file is only ever consumed by the daemon, so control is real
+    when the daemon is already running, or when fan hwmon the daemon can
+    drive exists (a pkexec daemon-start will then take effect). Merely
+    shipping omarchy-fan-set is not capability.
+    """
+    if not (Path(__file__).parent / "omarchy-fan-set").is_file():
+        return False
+    return is_daemon_running() or _has_controllable_fan(devices)
+
+
 def _clip(value: Any, limit: int = MAX_STR) -> str:
     return str(value)[:limit]
 
@@ -650,10 +739,25 @@ def collect(sample_seconds: float = SAMPLE_SECONDS) -> dict[str, Any]:
         "fan2_rpm": fan2_rpm,
         "fan_mode": read_fan_mode(),
         "fan_curve": read_fan_curve(),
-        "fan_control": (Path(__file__).parent / "omarchy-fan-set").is_file(),
+        "fan_control": fan_control_available(devices),
+        "daemon_running": is_daemon_running(),
         "top_mem": top_mem()[:MAX_LIST],
         "top_cpu": top_cpu()[:MAX_LIST],
     }
+
+
+def is_daemon_running() -> bool:
+    try:
+        for p in Path("/proc").glob("[0-9]*"):
+            try:
+                cmd = (p / "cmdline").read_bytes().replace(b"\x00", b" ")
+                if b"omarchy-fan-daemon" in cmd and b"system_monitor_stats" not in cmd:
+                    return True
+            except OSError:
+                continue
+    except OSError:
+        pass
+    return False
 
 
 def main() -> int:
