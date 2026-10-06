@@ -5,6 +5,7 @@ import json
 import os
 import stat
 import sys
+import time
 from pathlib import Path
 
 PRESETS = {
@@ -55,6 +56,9 @@ def write_mode(mode: str) -> None:
     dirfd = runtime_dirfd()
     try:
         _publish(dirfd, "current_fan_mode", mode.encode())
+        # The shell spawned us, so it is alive: refresh the heartbeat now so a
+        # fresh preset is not expired before the panel's next 30 s beat.
+        _publish(dirfd, "heartbeat", str(int(time.time())).encode())
     finally:
         os.close(dirfd)
 

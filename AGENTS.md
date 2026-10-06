@@ -14,7 +14,8 @@ preset or user curves to `fan*_target` (Apple Silicon `macsmc_hwmon`) or `pwm*`
 (`dell_smm`).
 
 This is the most complex plugin in the family: it is the only one that mutates
-hardware state, escalates to root via `pkexec`, and installs a systemd unit.
+hardware state. Root writes happen only in the `omarchy-fan-helper` package
+(`packaging/omarchy-fan-helper/` in the umbrella); the plugin never elevates.
 
 ## Provenance — edit in the umbrella, not here
 
@@ -34,12 +35,11 @@ next publish.** Make the change in the umbrella, then
 | `bin/system_monitor_stats.py` | Long-lived sampler. Emits bounded JSON on stdout |
 | `bin/kill_proc.py` | Kills one pid by number. Refuses `pid <= 1` |
 | `bin/omarchy-fan-set` | Writes fan mode + custom curve to `$XDG_RUNTIME_DIR/omarchy-fan/` |
-| `bin/omarchy-fan-daemon` | Polls the mode file every 2 s, applies the curve to hwmon |
-| `bin/omarchy-fan-daemon-start` | `#!/bin/bash`. Installs + starts the unit via `pkexec` |
-| `omarchy-fan-daemon.service` | systemd unit installed into `/etc/systemd/system/` |
+| `bin/omarchy-fan-daemon` | Source of the packaged root helper (installed to `/usr/lib/omarchy-fan/`); never run from this folder |
 
-`Panel.qml` execs the helpers with the absolute interpreter `/usr/bin/python3`.
-It is the only plugin here whose QML also owns a `pkexec` path.
+`Panel.qml` execs the helpers with the absolute interpreter `/usr/bin/python3`,
+reads the helper's `/run/omarchy-fan/status.json`, and writes the 30 s shell
+heartbeat with a FileView. It contains no `pkexec` path.
 
 ## Runtime Contract
 
@@ -84,7 +84,7 @@ text populates, the panel opens, and the mode badge matches the fan mode you set
 - `python3` at `/usr/bin/python3` (all helpers are Python)
 - A Linux laptop exposing `hwmon` thermal and fan sensors
 - Fan *control* additionally needs `macsmc_hwmon` or `dell_smm` fan targets, plus
-  `pkexec` to install and start the daemon
+  the `omarchy-fan-helper` package
 - Optional: `btop` + `omarchy-launch-or-focus-tui` for the middle-click launcher
 
 ## Conventions
@@ -102,14 +102,5 @@ text populates, the panel opens, and the mode badge matches the fan mode you set
 - Helpers live in `bin/`, not `~/.local/bin`.
 - Bump `version` in `manifest.json` when shipping a behavior change; the umbrella
   release flow tracks it.
-
-
-## Code graph index (optional accelerator)
-
-This repo may be indexed by `codebase-memory-mcp` (CBM) on an agent's local
-machine — `.codebase-memory/` is gitignored. If your harness exposes CBM
-tools (`search_graph`, `trace_path`, `get_architecture`, `detect_changes`),
-prefer them for structural questions — symbol lookup, caller/callee traces,
-impact analysis — instead of grep/read loops. Reindex after large refactors
-(`index_repository`); treat `.codebase-memory/graph.db.zst` as a local cache
-artifact, never commit it.
+- A daemon change ships as a new helper version: bump `HELPER_VERSION`, the
+  PKGBUILD `pkgver`, and `expectedHelperVersion` in `Panel.qml` together.

@@ -480,18 +480,131 @@ def gpu_info() -> tuple[str, int | None, str]:
     except (OSError, ValueError):
         pass
 
-    # 3. Apple Silicon AGX GPU (autodetected from SoC chip model)
-    if Path("/sys/devices/platform/soc/406400000.gpu").is_dir() or Path("/sys/bus/platform/drivers/apple-agx").is_dir():
+    # 3. Apple Silicon AGX GPU (asahi DRM driver)
+    if _is_asahi_gpu():
         c_name = cpu_name()
         gpu_name = f"{c_name} GPU" if "Apple" in c_name else "Apple Silicon GPU"
+        gpu_load = _asahi_gpu_load()
         # On Apple Silicon unified SoC, die temp is shared
         devices = hwmon_paths()
         cpu_t, _, _ = cpu_temp_and_fans(devices)
-        return gpu_name, None, cpu_t
+        return gpu_name, gpu_load, cpu_t
 
     # 4. Fallback to lspci
     gpu_name = _gpu_name_from_lspci() or "GPU"
     return gpu_name, gpu_load, gpu_temp
+
+
+def _is_asahi_gpu() -> bool:
+    if Path("/sys/bus/platform/drivers/asahi").is_dir() or Path("/sys/bus/platform/drivers/apple-agx").is_dir():
+        return True
+    try:
+        return any(Path("/sys/devices/platform/soc").glob("*.gpu"))
+    except OSError:
+        return False
+
+
+def gpu_clients() -> list[dict[str, Any]]:
+    """Processes holding /dev/dri/* fds — real GPU-usage signal on Asahi,
+    where the kernel exposes no utilization counter."""
+    clients: dict[int, str] = {}
+    try:
+        procs = list(Path("/proc").glob("[0-9]*"))
+    except OSError:
+        return []
+    for p in procs:
+        try:
+            pid = int(p.name)
+        except ValueError:
+            continue
+        try:
+            fds = list((p / "fd").iterdir())
+        except OSError:
+            continue
+        for fd in fds:
+            try:
+                tgt = os.readlink(fd)
+            except OSError:
+                continue
+            if tgt.startswith("/dev/dri/"):
+                try:
+                    comm = (p / "comm").read_text().strip() or p.name
+                except OSError:
+                    comm = p.name
+                clients[pid] = comm
+                break
+    out = [{"pid": pid, "name": _clip(name, 32)} for pid, name in sorted(clients.items())]
+    return out[:MAX_LIST]
+
+
+def _drm_engine_cycles() -> dict[str, int]:
+    """Aggregate drm-engine/drm-cycles counters across all DRM fds system-wide.
+    Empty dict when the kernel exposes no fdinfo stats (Asahi today)."""
+    totals: dict[str, int] = {}
+    try:
+        procs = list(Path("/proc").glob("[0-9]*"))
+    except OSError:
+        return totals
+    for p in procs:
+        try:
+            fds = list((p / "fd").iterdir())
+        except OSError:
+            continue
+        for fd in fds:
+            try:
+                tgt = os.readlink(fd)
+            except OSError:
+                continue
+            if not tgt.startswith("/dev/dri/"):
+                continue
+            try:
+                info = (p / "fdinfo" / fd.name).read_text()
+            except OSError:
+                continue
+            for line in info.splitlines():
+                if line.startswith("drm-engine-") or line.startswith("drm-cycles-"):
+                    key, _, val = line.partition(":")
+                    parts = val.strip().split()
+                    if parts:
+                        try:
+                            totals[key] = totals.get(key, 0) + int(parts[0])
+                        except ValueError:
+                            pass
+    return totals
+
+
+def _asahi_gpu_load(sample_seconds: float = SAMPLE_SECONDS) -> int | None:
+    """GPU busy% from DRM fdinfo deltas; None when the kernel exposes no
+    fdinfo counters (asahi driver on current kernels)."""
+    s1 = _drm_engine_cycles()
+    if not s1:
+        return None
+    time.sleep(sample_seconds)
+    s2 = _drm_engine_cycles()
+    keys = set(s1) | set(s2)
+    delta = sum(max(0, s2.get(k, 0) - s1.get(k, 0)) for k in keys)
+    engines = len(keys) or 1
+    # drm-engine-* counters are nanoseconds busy per engine
+    busy = 100.0 * delta / (sample_seconds * 1e9 * engines)
+    return max(0, min(100, round(busy)))
+
+
+def soc_power_w(devices: dict[str, Path] | None = None) -> float | None:
+    """SoC package power proxy: macsmc 'Heatpipe Power' rail, watts.
+    Not GPU-isolated — unified-SoC context signal."""
+    if devices is None:
+        devices = hwmon_paths()
+    macsmc = devices.get("macsmc_hwmon")
+    if not macsmc:
+        return None
+    for pf in macsmc.glob("power*_input"):
+        lf = macsmc / pf.name.replace("input", "label")
+        try:
+            if lf.is_file() and "heatpipe" in lf.read_text().lower():
+                return round(int(pf.read_text().strip()) / 1e6, 1)
+        except (OSError, ValueError):
+            continue
+    return None
 
 
 def _clean_gpu_name(raw: str) -> str:
@@ -693,14 +806,14 @@ def _has_controllable_fan(devices: dict[str, Path] | None = None) -> bool:
 def fan_control_available(devices: dict[str, Path] | None = None) -> bool:
     """Honest fan-control capability for the panel.
 
-    The mode file is only ever consumed by the daemon, so control is real
-    when the daemon is already running, or when fan hwmon the daemon can
-    drive exists (a pkexec daemon-start will then take effect). Merely
-    shipping omarchy-fan-set is not capability.
+    A daemon heartbeat proves that a helper is alive, not that a writable fan
+    target exists. Control is enabled only when the daemon's supported hwmon
+    interface exposes a real target node; a missing or read-only target keeps
+    the panel telemetry-only.
     """
     if not (Path(__file__).parent / "omarchy-fan-set").is_file():
         return False
-    return is_daemon_running() or _has_controllable_fan(devices)
+    return _has_controllable_fan(devices)
 
 
 def _clip(value: Any, limit: int = MAX_STR) -> str:
@@ -712,6 +825,13 @@ def collect(sample_seconds: float = SAMPLE_SECONDS) -> dict[str, Any]:
     devices = hwmon_paths()
     cpu_temp, fan1_rpm, fan2_rpm = cpu_temp_and_fans(devices)
     gpu_name, gpu_load, gpu_temp = gpu_info()
+    gpu_load_reason = ""
+    if gpu_load is None:
+        gpu_load_reason = (
+            "Asahi DRM utilization counter unavailable"
+            if _is_asahi_gpu()
+            else "GPU utilization counter unavailable"
+        )
 
     cpu_load, cpu_cores = _read_cpu_stats(sample_seconds=sample_seconds)
 
@@ -724,7 +844,10 @@ def collect(sample_seconds: float = SAMPLE_SECONDS) -> dict[str, Any]:
         "cpu_temp": _clip(cpu_temp, 16),
         "gpu_name": _clip(gpu_name),
         "gpu_load": gpu_load if gpu_load is not None else -1,
+        "gpu_load_reason": _clip(gpu_load_reason, 80),
         "gpu_temp": _clip(gpu_temp, 16),
+        "gpu_power_w": soc_power_w(devices),
+        "gpu_clients": gpu_clients(),
         "nvme_temp": _clip(nvme_temp(devices), 16),
         "ram_info": _clip(ram_info()),
         "mem_pct": mem["pct"],

@@ -1,16 +1,40 @@
 #!/usr/bin/python3
-"""Omarchy Fan Daemon: auto-curve, fixed presets, and a custom temperature curve."""
+"""Omarchy fan helper: silent auto curve, fixed presets, and a custom curve.
+
+Packaged as ``omarchy-fan-helper`` (see ``packaging/omarchy-fan-helper/``) and
+run as root from ``/usr/lib/omarchy-fan/`` by ``omarchy-fan-daemon.service``.
+The plugin never starts or installs it.
+
+Contract:
+- Fans go back to firmware control (macsmc ``fan_control=N``, dell
+  ``pwmN_enable=2``) on SIGTERM, from ``ExecStopPost`` (``handback``), and on
+  start after an unclean exit (the ``running`` marker survived).
+- Fixed presets (low/med/high) expire when the shell heartbeat is older than
+  ``HEARTBEAT_MAX_AGE`` seconds; the auto and custom curves keep running.
+- Status (version, mode, controllable) goes to ``/run/omarchy-fan/status.json``.
+  Everything under the desktop user's runtime directory is read-only to us.
+- The ACPI platform profile is never touched: power-profiles-daemon owns it.
+
+Every path is resolved under ``--root`` (default ``/``) so the whole helper
+runs against fixture sysfs trees.
+"""
 
 from __future__ import annotations
 
+import argparse
 import glob
 import json
 import os
+import signal
 import stat
+import subprocess
 import sys
 import time
 from pathlib import Path
+from typing import Callable
 
+# Must equal the PKGBUILD pkgver and Panel.qml expectedHelperVersion.
+HELPER_VERSION = "1.0.1"
 
 DEFAULT_CURVE = [
     [0, 0],
@@ -21,27 +45,88 @@ DEFAULT_CURVE = [
     [75, 255],
 ]
 
-# God-to-great auto curve: aggressively keeps temperatures in low 50s and below
+# Auto curve tuned for Asahi/M1 Max: silent under ~40C, then a long smooth
+# ramp. Between the EMA below and the slew limit, one hot sensor cannot make
+# the fans bounce.
 AUTO_CURVE = [
     [0, 0],
-    [36, 40],    # ~1500-1900 RPM whisper baseline
-    [40, 75],    # ~2200-2400 RPM gentle proactive cooling
-    [44, 120],   # ~2800-3000 RPM active thermal rejection
-    [48, 175],   # ~3400-3700 RPM aggressive ramp before 50°C
-    [51, 220],   # ~3900-4300 RPM high power to cap temperatures
-    [54, 255],   # 100% full blast to crush heat spikes
+    [40, 0],     # silent: fans off in the normal idle band
+    [44, 35],    # ~1600-1900 RPM, barely audible
+    [48, 70],    # ~2200-2500 RPM gentle cooling
+    [52, 115],   # ~2800-3100 RPM
+    [57, 165],   # ~3400-3600 RPM
+    [62, 215],   # ~3900-4300 RPM
+    [68, 255],   # 100% full blast
 ]
 
+PRESET_PWM = {"low": 128, "med": 204, "high": 255}
 
-def target_uid() -> int:
-    """Explicit target UID: via --uid arg, OMARCHY_FAN_UID env, SUDO_UID env, or current UID."""
-    for i, arg in enumerate(sys.argv[:-1]):
-        if arg == "--uid":
-            try:
-                return int(sys.argv[i + 1])
-            except ValueError:
-                pass
-    env = os.environ.get("OMARCHY_FAN_UID") or os.environ.get("SUDO_UID")
+# Anti-bounce: the loop samples every 2s and fans were re-targeted instantly,
+# so a max-temp reading flickering across a curve step boundary made RPM
+# oscillate. Smooth the temperature (EMA ~10s time constant) and rate-limit
+# PWM changes: fast on the way up (heat spikes still get cooled), slow on the
+# way down so the fan settles instead of hunting.
+TEMP_EMA_ALPHA = 0.30
+PWM_RISE_STEP = 12   # per 2s tick -> ~42s to full speed
+PWM_FALL_STEP = 4    # per 2s tick -> ~2min to fully settle
+PWM_DEADBAND = 2     # ignore target changes smaller than this
+
+TICK_SECONDS = 2
+# The panel writes the heartbeat every 30s; four missed beats means the shell
+# is gone and a fixed preset must not pin the fans.
+HEARTBEAT_MAX_AGE = 120
+
+STATE_DIR = "run/omarchy-fan"          # systemd RuntimeDirectory, root-owned
+MARKER_NAME = "running"
+STATUS_NAME = "status.json"
+MACSMC_PARAM = "sys/module/macsmc_hwmon/parameters/fan_control"
+UNIT_NAME = "omarchy-fan-daemon.service"
+LEGACY_UNIT = "etc/systemd/system/" + UNIT_NAME
+SYSTEMCTL = "/usr/bin/systemctl"
+
+
+class FanSmoother:
+    def __init__(self) -> None:
+        self.temp_ema: float | None = None
+        self.pwm: int = 0
+
+    def smooth_temp(self, temp: int) -> float:
+        if self.temp_ema is None:
+            self.temp_ema = float(temp)
+        else:
+            self.temp_ema += TEMP_EMA_ALPHA * (temp - self.temp_ema)
+        return self.temp_ema
+
+    def slew_pwm(self, target: int) -> int:
+        delta = target - self.pwm
+        if abs(delta) < PWM_DEADBAND:
+            return self.pwm
+        step = PWM_RISE_STEP if delta > 0 else PWM_FALL_STEP
+        self.pwm += max(-step, min(step, delta))
+        return self.pwm
+
+
+def _under(root: Path, absolute: str | Path) -> Path:
+    return Path(root) / str(absolute).lstrip("/")
+
+
+def _active_run_user(root: Path = Path("/")) -> int | None:
+    try:
+        run_users = [
+            int(path.name)
+            for path in _under(root, "/run/user").glob("[0-9]*")
+            if path.is_dir() and int(path.name) >= 1000
+        ]
+    except (OSError, ValueError):
+        return None
+    return sorted(run_users)[0] if run_users else None
+
+
+def target_uid(explicit: int | None = None, root: Path = Path("/")) -> int:
+    """Desktop user: explicit --uid, OMARCHY_FAN_UID, the caller, or the active session."""
+    if explicit is not None:
+        return explicit
+    env = os.environ.get("OMARCHY_FAN_UID")
     if env:
         try:
             return int(env)
@@ -50,109 +135,156 @@ def target_uid() -> int:
     uid = os.getuid()
     if uid != 0:
         return uid
-    # When running as root, detect active user session from /run/user
-    try:
-        run_users = [int(p.name) for p in Path("/run/user").glob("[0-9]*") if p.is_dir() and int(p.name) >= 1000]
-        if run_users:
-            return sorted(run_users)[0]
-    except (OSError, ValueError):
-        pass
-    return 1001
+    # Root must find a real desktop session; never invent a UID.
+    return _active_run_user(root) or -1
 
 
-def get_hwmon() -> tuple[str, Path | None]:
-    for name_file in glob.glob("/sys/class/hwmon/hwmon*/name"):
+def get_hwmon(root: Path = Path("/")) -> tuple[str, Path | None]:
+    for name_file in sorted(glob.glob(str(_under(root, "/sys/class/hwmon/hwmon*/name")))):
         try:
             content = Path(name_file).read_text().strip()
-            if content == "macsmc_hwmon":
-                return "macsmc", Path(name_file).parent
-            elif "dell_smm" in content:
-                return "dell", Path(name_file).parent
         except OSError:
             continue
+        if content == "macsmc_hwmon":
+            return "macsmc", Path(name_file).parent
+        if "dell_smm" in content:
+            return "dell", Path(name_file).parent
     return "unknown", None
 
 
-def get_max_temp() -> int:
+def get_max_temp(root: Path = Path("/")) -> int:
     temps: list[int] = []
-    for temp_file in glob.glob("/sys/class/thermal/thermal_zone*/temp"):
+    for temp_file in glob.glob(str(_under(root, "/sys/class/thermal/thermal_zone*/temp"))):
         try:
-            with open(temp_file, "r") as f:
-                val = int(f.read().strip())
-                if val > 1000:
-                    val = round(val / 1000)
-                if 10 <= val <= 115:
-                    temps.append(val)
+            val = int(Path(temp_file).read_text().strip())
+            if val > 1000:
+                val = round(val / 1000)
+            if 10 <= val <= 115:
+                temps.append(val)
         except (OSError, ValueError):
             continue
 
-    for temp_file in glob.glob("/sys/class/hwmon/hwmon*/temp*_input"):
+    for temp_file in glob.glob(str(_under(root, "/sys/class/hwmon/hwmon*/temp*_input"))):
         try:
-            with open(temp_file, "r") as f:
-                val = round(int(f.read().strip()) / 1000)
-                if 10 <= val <= 115:
-                    temps.append(val)
+            val = round(int(Path(temp_file).read_text().strip()) / 1000)
+            if 10 <= val <= 115:
+                temps.append(val)
         except (OSError, ValueError):
             continue
 
     return max(temps) if temps else 50
 
 
-def is_on_ac() -> bool:
-    for ac_file in glob.glob("/sys/class/power_supply/*ac*/online"):
-        try:
-            with open(ac_file, "r") as f:
-                if f.read().strip() == "1":
-                    return True
-        except OSError:
-            continue
-    for bat_status in glob.glob("/sys/class/power_supply/*bat*/status"):
-        try:
-            with open(bat_status, "r") as f:
-                status = f.read().strip().lower()
-                if status in {"charging", "full", "not charging"}:
-                    return True
-        except OSError:
-            continue
-    return False
-
-
-def set_platform_profile(profile: str) -> None:
-    path = Path("/sys/firmware/acpi/platform_profile")
-    if not path.is_file():
-        return
+def _write_attr(path: Path, value: str) -> bool:
     try:
-        current = path.read_text().strip()
-        if current != profile:
-            path.write_text(profile)
+        path.write_text(value)
+        return True
     except OSError:
-        pass
+        return False
 
 
-def set_fan_speed(hw_type: str, hwmon: Path | None, pwm_val: int) -> None:
+def _can_write(path: Path) -> bool:
+    """True when this process can open the attribute for writing (nothing is written)."""
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError:
+        return False
+    os.close(fd)
+    return True
+
+
+def fan_targets(hw_type: str, hwmon: Path | None) -> list[Path]:
+    if hwmon is None:
+        return []
+    if hw_type == "macsmc":
+        return sorted(hwmon.glob("fan[0-9]*_target"))
+    if hw_type == "dell":
+        return sorted(p for p in hwmon.glob("pwm[0-9]") if p.is_file())
+    return []
+
+
+def is_controllable(hw_type: str, hwmon: Path | None, root: Path = Path("/")) -> bool:
+    """Control needs every fan target writable, not merely present."""
+    targets = fan_targets(hw_type, hwmon)
+    if not targets or not all(_can_write(t) for t in targets):
+        return False
+    if hw_type == "macsmc":
+        param = _under(root, MACSMC_PARAM)
+        if param.exists() and not _can_write(param):
+            return False
+    return True
+
+
+def _macsmc_release(hwmon: Path | None, root: Path) -> None:
+    """Put the SMC fans back in automatic mode (best effort).
+
+    macsmc-hwmon rejects fanN_target writes with -EOPNOTSUPP once fan_control
+    is N, and a target of 0 written while it is Y is the only call that sets the
+    SMC fan mode back to automatic. So: enable control, zero every target, then
+    drop control.
+    """
+    param = _under(root, MACSMC_PARAM)
+    if param.is_file():
+        try:
+            current = param.read_text().strip()
+        except OSError:
+            current = ""
+        if current != "Y":
+            _write_attr(param, "Y")
+    for target in fan_targets("macsmc", hwmon):
+        _write_attr(target, "0")
+    if param.is_file():
+        _write_attr(param, "N")
+
+
+def _macsmc_acquire(hwmon: Path | None, root: Path) -> None:
+    """Unlock macsmc fan control (best effort).
+
+    macsmc-hwmon defaults fan_control to N and probes fanN_target 0444, so
+    both gates must be lifted before targets accept writes. kernfs honours
+    chmod on sysfs attrs and the daemon runs as root, so both are runtime
+    recoverable — no kernel cmdline change needed. Idempotent.
+    """
+    if hwmon is None:
+        return
+    param = _under(root, MACSMC_PARAM)
+    if param.is_file():
+        _write_attr(param, "Y")
+    for target in fan_targets("macsmc", hwmon):
+        try:
+            os.chmod(target, 0o644)
+        except OSError:
+            pass
+
+
+def hand_back(hw_type: str, hwmon: Path | None, root: Path = Path("/")) -> None:
+    """Return the fans to firmware control."""
+    if hw_type == "macsmc":
+        _macsmc_release(hwmon, root)
+    elif hw_type == "dell" and hwmon is not None:
+        for enable in sorted(hwmon.glob("pwm[0-9]_enable")):
+            _write_attr(enable, "2")
+
+
+def set_fan_speed(hw_type: str, hwmon: Path | None, pwm_val: int, root: Path = Path("/")) -> None:
     if not hwmon:
         return
 
     if hw_type == "macsmc":
-        ctrl_param = Path("/sys/module/macsmc_hwmon/parameters/fan_control")
-        if ctrl_param.is_file():
-            try:
-                if pwm_val == 0:
-                    if ctrl_param.read_text().strip() != "N":
-                        ctrl_param.write_text("N")
-                else:
-                    if ctrl_param.read_text().strip() != "Y":
-                        ctrl_param.write_text("Y")
-            except OSError:
-                pass
+        ctrl_param = _under(root, MACSMC_PARAM)
+        try:
+            ctrl = ctrl_param.read_text().strip() if ctrl_param.is_file() else None
+        except OSError:
+            ctrl = None
 
         if pwm_val == 0:
-            for target_name in ("fan1_target", "fan2_target"):
-                try:
-                    (hwmon / target_name).write_text("0")
-                except OSError:
-                    pass
+            # Floor: firmware owns the fans. Already released when control is off.
+            if ctrl != "N":
+                _macsmc_release(hwmon, root)
             return
+
+        if ctrl is not None and ctrl != "Y":
+            _write_attr(ctrl_param, "Y")
 
         def _get_limit(p: Path, default: int) -> int:
             try:
@@ -167,125 +299,144 @@ def set_fan_speed(hw_type: str, hwmon: Path | None, pwm_val: int) -> None:
         target1 = round(f1_min + (f1_max - f1_min) * ratio)
         target2 = round(f2_min + (f2_max - f2_min) * ratio)
 
-        try:
-            os.chmod(hwmon / "fan1_target", 0o644)
-        except OSError:
-            pass
-        try:
-            (hwmon / "fan1_target").write_text(str(target1))
-        except OSError:
-            pass
-        try:
-            os.chmod(hwmon / "fan2_target", 0o644)
-        except OSError:
-            pass
-        try:
-            (hwmon / "fan2_target").write_text(str(target2))
-        except OSError:
-            pass
+        for name, value in (("fan1_target", target1), ("fan2_target", target2)):
+            try:
+                os.chmod(hwmon / name, 0o644)
+            except OSError:
+                pass
+            _write_attr(hwmon / name, str(value))
 
     elif hw_type == "dell":
         for pwm_name, enable_name in [("pwm1", "pwm1_enable"), ("pwm2", "pwm2_enable")]:
-            try:
-                en_path = hwmon / enable_name
-                if en_path.is_file():
-                    en_path.write_text("1")
-            except OSError:
-                pass
-            try:
-                p_path = hwmon / pwm_name
-                if p_path.is_file():
-                    p_path.write_text(str(max(0, min(255, pwm_val))))
-            except OSError:
-                pass
+            en_path = hwmon / enable_name
+            if en_path.is_file():
+                _write_attr(en_path, "1")
+            p_path = hwmon / pwm_name
+            if p_path.is_file():
+                _write_attr(p_path, str(max(0, min(255, pwm_val))))
 
 
-def get_requested_mode(uid: int | None = None) -> str:
-    if uid is None:
-        uid = target_uid()
-    rdir = Path(f"/run/user/{uid}/omarchy-fan")
+def _open_owned_dir(path: Path, uid: int) -> int | None:
+    """Read-only descriptor for a real directory owned by ``uid``."""
+    try:
+        dfd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError:
+        return None
+    st = os.fstat(dfd)
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != uid:
+        os.close(dfd)
+        return None
+    return dfd
+
+
+def _user_runtime_dirfd(uid: int, root: Path = Path("/")) -> int | None:
+    rdir = _under(root, f"/run/user/{uid}/omarchy-fan")
     if not rdir.is_dir():
         try:
             import pwd
-            home = Path(pwd.getpwuid(uid).pw_dir)
-            rdir = home / ".local" / "run" / "omarchy-fan"
+            rdir = _under(root, pwd.getpwuid(uid).pw_dir) / ".local" / "run" / "omarchy-fan"
         except (KeyError, ImportError):
             pass
+    return _open_owned_dir(rdir, uid)
 
+
+def _open_user_file(dfd: int, name: str, uid: int, max_size: int) -> tuple[int, os.stat_result] | None:
     try:
-        dfd = os.open(rdir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        ffd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dfd)
     except OSError:
-        return "auto"
+        return None
+    fst = os.fstat(ffd)
+    if not stat.S_ISREG(fst.st_mode) or fst.st_uid != uid or fst.st_size > max_size:
+        os.close(ffd)
+        return None
+    return ffd, fst
 
+
+def get_requested_mode(uid: int | None = None, root: Path = Path("/"), dirfd: int | None = None) -> str:
+    """Requested mode; ``dirfd`` is an already-open runtime dir (left open)."""
+    if uid is None:
+        uid = target_uid(root=root)
+    if uid < 0:
+        return "auto"
+    dfd = _user_runtime_dirfd(uid, root) if dirfd is None else dirfd
+    if dfd is None:
+        return "auto"
     try:
-        dst = os.fstat(dfd)
-        if not stat.S_ISDIR(dst.st_mode) or dst.st_uid != uid:
+        opened = _open_user_file(dfd, "current_fan_mode", uid, 64)
+        if opened is None:
             return "auto"
+        ffd, _ = opened
         try:
-            ffd = os.open("current_fan_mode", os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dfd)
-        except OSError:
-            return "auto"
-        try:
-            fst = os.fstat(ffd)
-            if not stat.S_ISREG(fst.st_mode) or fst.st_uid != uid or fst.st_size > 64:
-                return "auto"
             data = os.read(ffd, 64).decode("utf-8", errors="replace").strip().lower()
-            if data in {"auto", "low", "med", "high", "custom"} or data.startswith("custom-"):
-                return data
         finally:
             os.close(ffd)
+        if data in {"auto", "low", "med", "high", "custom"} or data.startswith("custom-"):
+            return data
     finally:
-        os.close(dfd)
-
+        if dirfd is None:
+            os.close(dfd)
     return "auto"
 
 
-def load_curve(uid: int | None = None) -> list[list[int]]:
+def heartbeat_age(
+    uid: int, root: Path = Path("/"), now: float | None = None, dirfd: int | None = None
+) -> float | None:
+    """Seconds since the shell last wrote its heartbeat, or None when absent.
+
+    ``dirfd`` is an already-open runtime dir (left open)."""
+    if uid < 0:
+        return None
+    dfd = _user_runtime_dirfd(uid, root) if dirfd is None else dirfd
+    if dfd is None:
+        return None
+    try:
+        opened = _open_user_file(dfd, "heartbeat", uid, 4096)
+        if opened is None:
+            return None
+        ffd, fst = opened
+        os.close(ffd)
+    finally:
+        if dirfd is None:
+            os.close(dfd)
+    return (time.time() if now is None else now) - fst.st_mtime
+
+
+def load_curve(uid: int | None = None, root: Path = Path("/")) -> list[list[int]]:
     if uid is None:
-        uid = target_uid()
+        uid = target_uid(root=root)
     try:
         import pwd
-        home = Path(pwd.getpwuid(uid).pw_dir)
-        cdir = home / ".config" / "omarchy"
-    except (KeyError, ImportError):
+        cdir = _under(root, pwd.getpwuid(uid).pw_dir) / ".config" / "omarchy"
+    except (KeyError, ImportError, OverflowError):
         return DEFAULT_CURVE
 
-    try:
-        dfd = os.open(cdir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-    except OSError:
+    dfd = _open_owned_dir(cdir, uid)
+    if dfd is None:
         return DEFAULT_CURVE
-
     try:
-        dst = os.fstat(dfd)
-        if not stat.S_ISDIR(dst.st_mode) or dst.st_uid != uid:
+        opened = _open_user_file(dfd, "fan_curve.json", uid, 65536)
+        if opened is None:
             return DEFAULT_CURVE
+        ffd, _ = opened
         try:
-            ffd = os.open("fan_curve.json", os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dfd)
-        except OSError:
-            return DEFAULT_CURVE
-        try:
-            fst = os.fstat(ffd)
-            if not stat.S_ISREG(fst.st_mode) or fst.st_uid != uid or fst.st_size > 65536:
-                return DEFAULT_CURVE
-            raw = os.read(ffd, 65536).decode("utf-8", errors="replace")
-            data = json.loads(raw)
+            data = json.loads(os.read(ffd, 65536).decode("utf-8", errors="replace"))
             if isinstance(data, list) and all(isinstance(p, list) and len(p) == 2 for p in data):
-                return [[int(p[0]), int(p[1])] for p in data]
-        except (OSError, ValueError):
+                return [
+                    [max(0, min(120, int(p[0]))), max(0, min(255, int(p[1])))] for p in data
+                ]
+        except (OSError, ValueError, TypeError, OverflowError, RecursionError):
             pass
         finally:
             os.close(ffd)
     finally:
         os.close(dfd)
-
     return DEFAULT_CURVE
 
 
-def curve_pwm(temp: int, curve: list[list[int]]) -> int:
+def curve_pwm(temp: float, curve: list[list[int]]) -> int:
     """Linearly interpolate a PWM for the given temp from (temp, pwm) points."""
     if not curve:
         return 0
-    # ensure sorted by temperature
     curve = sorted(curve, key=lambda p: p[0])
     if temp <= curve[0][0]:
         return curve[0][1]
@@ -301,50 +452,241 @@ def curve_pwm(temp: int, curve: list[list[int]]) -> int:
     return curve[-1][1]
 
 
-def main() -> None:
-    hw_type, hwmon = get_hwmon()
-    uid = target_uid()
-    while True:
-        mode = get_requested_mode(uid)
-        temp = get_max_temp()
-        on_ac = is_on_ac()
+def effective_mode(requested: str, beat_age: float | None) -> str:
+    """Fixed presets need a live shell; curves do not."""
+    if requested in PRESET_PWM and (beat_age is None or beat_age > HEARTBEAT_MAX_AGE):
+        return "auto"
+    if requested.startswith("custom"):
+        return "custom"
+    return requested
 
-        if mode == "auto":
-            # God-to-great auto curve: proactively cools to maintain low 50s and below
-            pwm = curve_pwm(temp, AUTO_CURVE)
-            if temp >= 52:
-                set_platform_profile("cool")
-            elif temp >= 45:
-                set_platform_profile("balanced")
-            else:
-                set_platform_profile("quiet")
-            set_fan_speed(hw_type, hwmon, pwm)
 
-        elif mode == "low":
-            set_platform_profile("quiet")
-            set_fan_speed(hw_type, hwmon, 128)
+class FanHelper:
+    def __init__(
+        self,
+        root: Path = Path("/"),
+        uid: int | None = None,
+        clock: Callable[[], float] = time.time,
+    ) -> None:
+        self.root = Path(root)
+        self.explicit_uid = uid
+        self.clock = clock
+        self.smoother = FanSmoother()
+        self.state_dir = _under(self.root, STATE_DIR)
+        self._last_status: bytes | None = None
 
-        elif mode == "med":
-            set_platform_profile("balanced")
-            set_fan_speed(hw_type, hwmon, 204)
+    # --- state dir (root-owned) -------------------------------------------
 
-        elif mode == "high":
-            set_platform_profile("cool")
-            set_fan_speed(hw_type, hwmon, 255)
+    def _state_dirfd(self) -> int:
+        os.makedirs(self.state_dir, mode=0o755, exist_ok=True)
+        fd = _open_owned_dir(self.state_dir, os.geteuid())
+        if fd is None:
+            raise PermissionError(f"{self.state_dir} is not a helper-owned directory")
+        return fd
 
-        elif mode == "custom" or mode.startswith("custom-"):
-            curve = load_curve(uid)
-            pwm = curve_pwm(temp, curve)
-            if temp >= 65:
-                set_platform_profile("cool")
-            elif temp >= 55:
-                set_platform_profile("balanced")
-            else:
-                set_platform_profile("quiet")
-            set_fan_speed(hw_type, hwmon, pwm)
+    def _publish(self, name: str, content: bytes) -> None:
+        dirfd = self._state_dirfd()
+        try:
+            tmp = f".{name}.{os.getpid()}.tmp"
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644, dir_fd=dirfd)
+            try:
+                os.fchmod(fd, 0o644)
+                os.write(fd, content)
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            os.rename(tmp, name, src_dir_fd=dirfd, dst_dir_fd=dirfd)
+        finally:
+            os.close(dirfd)
 
-        time.sleep(2)
+    def _marker_exists(self) -> bool:
+        return (self.state_dir / MARKER_NAME).exists()
+
+    def _remove_marker(self) -> None:
+        try:
+            dirfd = self._state_dirfd()
+        except OSError:
+            return
+        try:
+            os.unlink(MARKER_NAME, dir_fd=dirfd)
+        except FileNotFoundError:
+            pass
+        finally:
+            os.close(dirfd)
+
+    def write_status(self, mode: str, controllable: bool, hw_type: str) -> None:
+        payload = json.dumps(
+            {"version": HELPER_VERSION, "mode": mode, "controllable": controllable, "hw": hw_type},
+            sort_keys=True,
+        ).encode()
+        if payload != self._last_status:
+            self._publish(STATUS_NAME, payload)
+            self._last_status = payload
+
+    # --- lifecycle --------------------------------------------------------
+
+    def release_fans(self) -> None:
+        hw_type, hwmon = get_hwmon(self.root)
+        hand_back(hw_type, hwmon, self.root)
+
+    def startup(self) -> None:
+        if self._marker_exists():
+            # The last run never reached shutdown(): fans may be pinned.
+            self.release_fans()
+        self._publish(MARKER_NAME, f"{os.getpid()}\n".encode())
+
+    def shutdown(self) -> None:
+        self.release_fans()
+        self._remove_marker()
+
+    def tick(self) -> str:
+        hw_type, hwmon = get_hwmon(self.root)
+        uid = target_uid(self.explicit_uid, self.root)
+        dirfd = _user_runtime_dirfd(uid, self.root) if uid >= 0 else None
+        try:
+            requested = get_requested_mode(uid, self.root, dirfd=dirfd)
+            beat_age = None
+            if requested in PRESET_PWM and dirfd is not None:
+                beat_age = heartbeat_age(uid, self.root, self.clock(), dirfd=dirfd)
+        finally:
+            if dirfd is not None:
+                os.close(dirfd)
+        mode = effective_mode(requested, beat_age)
+        temp = self.smoother.smooth_temp(get_max_temp(self.root))
+
+        if mode in PRESET_PWM:
+            pwm = PRESET_PWM[mode]
+            # Keep the smoother in step so an expiring preset falls gradually.
+            self.smoother.pwm = pwm
+        elif mode == "custom":
+            pwm = self.smoother.slew_pwm(curve_pwm(temp, load_curve(uid, self.root)))
+        else:
+            mode = "auto"
+            pwm = self.smoother.slew_pwm(curve_pwm(temp, AUTO_CURVE))
+
+        controllable = is_controllable(hw_type, hwmon, self.root)
+        if not controllable and hw_type == "macsmc":
+            # Gate check fails before set_fan_speed's own unlock can run
+            # (targets probe 0444, fan_control=N at boot) — acquire, recheck.
+            _macsmc_acquire(hwmon, self.root)
+            controllable = is_controllable(hw_type, hwmon, self.root)
+        if controllable:
+            set_fan_speed(hw_type, hwmon, pwm, self.root)
+        self.write_status(mode, controllable, hw_type)
+        return mode
+
+
+# --- package install hook ---------------------------------------------------
+
+def _exec_start_path(unit_text: str) -> str | None:
+    for line in unit_text.splitlines():
+        line = line.strip()
+        if line.startswith("ExecStart="):
+            value = line.split("=", 1)[1].lstrip("-@:+!")
+            parts = value.split()
+            return parts[0] if parts else None
+    return None
+
+
+def _user_owned(path: str, root: Path) -> bool:
+    """True when the executable or any directory above it belongs to a non-root user.
+
+    A root-owned file inside a user-owned directory can still be swapped, so
+    every existing component counts (symlinks are not followed).
+    """
+    current = Path("/") / path.lstrip("/")
+    while current != current.parent:
+        try:
+            if os.lstat(_under(root, current)).st_uid != 0:
+                return True
+        except OSError:
+            pass
+        current = current.parent
+    return False
+
+
+def migrate_legacy_unit(
+    root: Path = Path("/"),
+    run: Callable[..., object] = subprocess.run,
+    out=sys.stdout,
+) -> bool:
+    """Replace a hand-installed unit that runs the helper from a user-owned path.
+
+    Returns True when one was disabled, removed, and the packaged unit took over.
+    """
+    unit = _under(root, "/" + LEGACY_UNIT)
+    try:
+        text = unit.read_text()
+    except OSError:
+        return False
+    exec_path = _exec_start_path(text)
+    if not exec_path or not _user_owned(exec_path, root):
+        return False
+
+    run([SYSTEMCTL, "disable", "--now", UNIT_NAME], check=False)
+    # The old daemon had no hand-back: do it now so the fans are never pinned.
+    FanHelper(root=root).release_fans()
+    unit.unlink()
+    run([SYSTEMCTL, "daemon-reload"], check=False)
+    run([SYSTEMCTL, "enable", "--now", UNIT_NAME], check=False)
+    print(
+        f"omarchy-fan-helper: replaced hand-installed /{LEGACY_UNIT} "
+        f"(ExecStart={exec_path}) with the packaged unit",
+        file=out,
+    )
+    return True
+
+
+# --- entrypoint -------------------------------------------------------------
+
+def _terminate(_signum, _frame) -> None:
+    raise SystemExit(0)
+
+
+def run_loop(helper: FanHelper) -> None:
+    signal.signal(signal.SIGTERM, _terminate)
+    helper.startup()
+    try:
+        while True:
+            try:
+                helper.tick()
+            except Exception as exc:  # one bad tick must not crash-loop the unit
+                print(f"omarchy-fan-daemon: tick failed: {exc!r}", file=sys.stderr)
+            time.sleep(TICK_SECONDS)
+    finally:
+        helper.shutdown()
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="omarchy-fan-daemon")
+    parser.add_argument("command", nargs="?", default="run",
+                        choices=["run", "handback", "migrate-legacy-unit"])
+    parser.add_argument("--root", default="/", help="filesystem root (fixture trees)")
+    parser.add_argument("--uid", type=int, default=None, help="desktop user to follow")
+    args = parser.parse_args(argv)
+    root = Path(args.root)
+
+    # A root helper must not run from a path its desktop user can rewrite (a
+    # legacy hand-installed unit pointing into the plugin checkout).
+    if os.geteuid() == 0 and root == Path("/") and _user_owned(os.path.realpath(__file__), root):
+        FanHelper(root=root).release_fans()
+        print("omarchy-fan-daemon: refusing to run as root from a user-owned path; "
+              "install the omarchy-fan-helper package", file=sys.stderr)
+        return 78
+
+    if args.command == "handback":
+        FanHelper(root=root).release_fans()
+        return 0
+    if args.command == "migrate-legacy-unit":
+        if not migrate_legacy_unit(root):
+            wants = _under(root, "/etc/systemd/system/multi-user.target.wants/" + UNIT_NAME)
+            if not wants.exists():
+                print(f"omarchy-fan-helper: enable fan control with "
+                      f"'systemctl enable --now {UNIT_NAME}'")
+        return 0
+    run_loop(FanHelper(root=root, uid=args.uid))
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

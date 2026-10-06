@@ -14,6 +14,9 @@ Ready to install. The manifest, README, and LICENSE all pass `omarchy plugin val
 
 ## Future work
 
+- [ ] Deeper RAM view (pressure/PSI, per-process RSS detail)
+- [ ] Better process-kill UX (filter/search, GPU-client highlighting)
+- [ ] GPU utilization % once asahi fdinfo counters land in the kernel
 - [ ] Configurable temperature thresholds in the bar widget
 - [ ] GPU-specific fan curves
 - [ ] Hibernation / AC-power-aware auto curve

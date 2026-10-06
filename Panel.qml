@@ -26,7 +26,10 @@ Panel {
   property string cpuTemp: "--"
   property string gpuName: "GPU"
   property int gpuLoad: -1
+  property string gpuLoadReason: ""
   property string gpuTemp: "--"
+  property real gpuPowerW: -1
+  property var gpuClients: []
   property string nvmeTemp: "--"
   property int fan1Rpm: 0
   property int fan2Rpm: 0
@@ -38,8 +41,21 @@ Panel {
   // Last stderr chunk from the stats helper — appended to fetchError when
   // the process exits non-zero so a crash carries diagnostics.
   property string statsStderr: ""
-  property bool fanControl: false
-  property bool daemonRunning: false
+  // Fan control is owned by the omarchy-fan-helper package (root, from
+  // /usr/lib/omarchy-fan). The plugin never installs or elevates it: it only
+  // reads the helper's status and asks for a package install/update.
+  readonly property string expectedHelperVersion: "1.0.1"
+  // "missing" | "outdated" | "ok"
+  property string helperState: "missing"
+  property string helperVersion: ""
+  property bool helperControllable: false
+  property string helperMode: ""
+  // A mode the user just requested; the helper status lags by up to one tick,
+  // so readHelperStatus must not revert currentMode until it catches up.
+  property string pendingMode: ""
+  property real pendingUntil: 0
+  readonly property bool fanControl: root.helperState === "ok" && root.helperControllable
+  readonly property bool helperModeActive: root.helperState === "ok" && root.helperMode.length > 0
   property int selectedProc: 0
 
   readonly property color fg: bar ? bar.foreground : Color.foreground
@@ -72,17 +88,59 @@ Panel {
     "LC_ALL": "C"
   })
 
-  function triggerDaemon() {
-    Quickshell.execDetached(["pkexec", root.pluginRoot + "/bin/omarchy-fan-daemon-start"])
-    refreshTimer.restart()
+  // loaded=false: the status file is gone (helper not installed or stopped).
+  function readHelperStatus(loaded) {
+    var raw = ""
+    if (loaded) {
+      try {
+        raw = String(helperStatusFile.text() || "")
+      } catch (e) {
+        raw = ""
+      }
+    }
+    var data = null
+    if (raw.length > 0 && raw.length < 4096) {
+      try {
+        data = JSON.parse(raw)
+      } catch (e2) {
+        data = null
+      }
+    }
+    if (!data || typeof data !== "object") {
+      root.helperState = "missing"
+      root.helperVersion = ""
+      root.helperControllable = false
+      root.helperMode = ""
+      return
+    }
+    root.helperVersion = clipStr(data.version, 24)
+    root.helperState = root.helperVersion === root.expectedHelperVersion ? "ok" : "outdated"
+    root.helperControllable = data.controllable === true
+    root.helperMode = clipStr(data.mode, 24).trim()
+    if (root.pendingMode.length > 0 && (root.helperMode === root.pendingMode || Date.now() > root.pendingUntil))
+      root.pendingMode = ""
+    if (root.helperModeActive && root.pendingMode.length === 0)
+      root.currentMode = root.helperMode
+  }
+
+  function helperHint() {
+    if (root.helperState === "missing")
+      return "Fan control: install the omarchy-fan-helper package and run 'systemctl enable --now omarchy-fan-daemon.service'"
+    if (root.helperState === "outdated")
+      return "Fan control: update the omarchy-fan-helper package (have " + (root.helperVersion || "?") + ", need " + root.expectedHelperVersion + ")"
+    if (!root.helperControllable)
+      return "Fan control: no writable fan target here"
+    return "Helper " + root.helperVersion
   }
 
   function setMode(mode) {
-    if (!mode || !root.fanControl)
+    // "auto" is always safe to write, so it bypasses the fanControl guard
+    // whenever a helper is present (e.g. version drift with a pinned preset).
+    if (!mode || !(root.fanControl || (mode === "auto" && root.helperState !== "missing")))
       return
-    if (!root.daemonRunning)
-      triggerDaemon()
     currentMode = mode
+    root.pendingMode = mode
+    root.pendingUntil = Date.now() + 6000
     Quickshell.execDetached([root.py, root.pluginRoot + "/bin/omarchy-fan-set", mode])
     refreshTimer.restart()
   }
@@ -90,9 +148,9 @@ Panel {
   function setCustom(name) {
     if (!root.fanControl)
       return
-    if (!root.daemonRunning)
-      triggerDaemon()
     currentMode = "custom"
+    root.pendingMode = "custom"
+    root.pendingUntil = Date.now() + 6000
     customName = name
     Quickshell.execDetached([root.py, root.pluginRoot + "/bin/omarchy-fan-set", "custom", name])
     refreshTimer.restart()
@@ -101,13 +159,14 @@ Panel {
   function cycleMode() {
     if (!root.fanControl)
       return
-    if (currentMode === "auto")
+    var from = root.pendingMode.length > 0 ? root.pendingMode : currentMode
+    if (from === "auto")
       setMode("low")
-    else if (currentMode === "low")
+    else if (from === "low")
       setMode("med")
-    else if (currentMode === "med")
+    else if (from === "med")
       setMode("high")
-    else if (currentMode === "high")
+    else if (from === "high")
       setMode("custom")
     else
       setMode("auto")
@@ -128,6 +187,7 @@ Panel {
   }
 
   function refresh() {
+    helperStatusFile.reload()
     if (!statusProc.running) {
       root.isRefreshing = true
       statusProc.running = true
@@ -199,7 +259,8 @@ Panel {
             return
           }
           root.fetchError = ""
-          if (data.fan_mode)
+          // The helper's effective mode wins: an expired preset shows as auto.
+          if (data.fan_mode && !root.helperModeActive)
             root.currentMode = clipStr(data.fan_mode, 24).trim()
           if (data.cpu_name)
             root.cpuName = clipStr(data.cpu_name)
@@ -231,8 +292,16 @@ Panel {
             var gl = parseInt(data.gpu_load)
             root.gpuLoad = isNaN(gl) ? -1 : Math.max(0, Math.min(100, gl))
           }
+          if (data.gpu_load_reason !== undefined)
+            root.gpuLoadReason = clipStr(data.gpu_load_reason, 80)
           if (data.gpu_temp)
             root.gpuTemp = clipStr(data.gpu_temp, 16)
+          root.gpuPowerW = (typeof data.gpu_power_w === "number") ? data.gpu_power_w : -1
+          if (Array.isArray(data.gpu_clients))
+            root.gpuClients = data.gpu_clients.slice(0, 24).map(function(c) {
+              c.name = clipStr(c.name, 32)
+              return c
+            })
           if (data.nvme_temp)
             root.nvmeTemp = clipStr(data.nvme_temp, 16)
           if (data.fan1_rpm !== undefined)
@@ -251,8 +320,6 @@ Panel {
             })
           if (Array.isArray(data.fan_curve))
             root.fanCurve = data.fan_curve
-          root.fanControl = !!data.fan_control
-          root.daemonRunning = !!data.daemon_running
           if (root.selectedProc >= root.topMem.length)
             root.selectedProc = Math.max(0, root.topMem.length - 1)
         } catch (e) {
@@ -296,6 +363,45 @@ Panel {
     }
   }
 
+  // Root-owned status from the packaged helper (version, mode, controllable).
+  // Re-read on every stats refresh; a read is spawn-free.
+  FileView {
+    id: helperStatusFile
+    path: "/run/omarchy-fan/status.json"
+    watchChanges: false
+    printErrors: false
+    onLoaded: root.readHelperStatus(true)
+    onLoadFailed: root.readHelperStatus(false)
+  }
+
+  // Shell heartbeat for the helper: fixed presets expire when it is older than
+  // 120 s, so the fans never stay pinned after the shell is gone. Written in
+  // place (no process spawn) every 30 s, independent of panel visibility or
+  // screen lock. The directory is created by omarchy-fan-set when a mode is
+  // chosen; before that there is no preset to keep alive.
+  readonly property string heartbeatPath: {
+    var base = Quickshell.env("XDG_RUNTIME_DIR")
+    return base ? base + "/omarchy-fan/heartbeat" : ""
+  }
+
+  FileView {
+    id: heartbeatFile
+    path: root.heartbeatPath
+    preload: false
+    watchChanges: false
+    atomicWrites: true
+    printErrors: false
+  }
+
+  Timer {
+    id: heartbeatTimer
+    interval: 30000
+    running: root.heartbeatPath.length > 0 && root.fanControl
+    repeat: true
+    triggeredOnStart: true
+    onTriggered: heartbeatFile.setText(String(Math.floor(Date.now() / 1000)))
+  }
+
   Timer {
     id: refreshTimer
     interval: 5000
@@ -313,7 +419,7 @@ Panel {
     fontSize: Style.font.bodySmall
     active: root.memPct >= 80 || root.currentMode === "high" || (root.currentMode === "auto" && parseInt(root.cpuTemp) >= 60)
     activeColor: root.memPct >= 85 || parseInt(root.cpuTemp) >= 65 ? root.urgent : (root.bar ? root.bar.barForeground : Color.foreground)
-    tooltipText: "RAM " + root.memUsed + "/" + root.memTotal + "G · CPU " + root.cpuLoad + "% " + root.cpuTemp + " · GPU " + root.gpuTemp + " · SSD " + root.nvmeTemp + (root.fanControl ? " · right-click cycles fan · middle btop" : " · fan control unavailable")
+    tooltipText: "RAM " + root.memUsed + "/" + root.memTotal + "G · CPU " + root.cpuLoad + "% " + root.cpuTemp + " · GPU " + root.gpuTemp + (root.gpuPowerW >= 0 ? " " + root.gpuPowerW.toFixed(0) + "W" : "") + (root.gpuClients.length > 0 ? " (" + root.gpuClients.length + " procs)" : "") + " · SSD " + root.nvmeTemp + (root.fanControl ? " · right-click cycles fan · middle btop" : " · fan control unavailable")
     horizontalMargin: 4.0
     onPressed: function (buttonCode) {
       if (buttonCode === Qt.RightButton)
@@ -359,6 +465,7 @@ Panel {
       RowLayout {
         width: parent.width
         Text {
+          textFormat: Text.PlainText
           text: "Resource & Fan"
           color: root.fg
           font.family: root.bar ? root.bar.fontFamily : Style.font.family
@@ -416,6 +523,7 @@ Panel {
         RowLayout {
           width: parent.width
           Text {
+            textFormat: Text.PlainText
             text: "CPU " + root.cpuLoad + "%"
             color: root.levelColor(root.cpuLoad, 70, 90)
             font.family: root.bar ? root.bar.fontFamily : Style.font.family
@@ -487,6 +595,7 @@ Panel {
                 width: parent.width * Math.max(0, Math.min(1, modelData.percent / 100.0))
               }
               Text {
+                textFormat: Text.PlainText
                 anchors.centerIn: parent
                 text: "C" + modelData.core
                 color: root.fg
@@ -507,6 +616,7 @@ Panel {
         RowLayout {
           width: parent.width
           Text {
+            textFormat: Text.PlainText
             text: "Memory"
             color: root.fg
             font.bold: true
@@ -537,6 +647,7 @@ Panel {
           }
         }
         Text {
+          textFormat: Text.PlainText
           text: "avail " + root.memAvail + "G · swap " + root.swapUsed + "/" + root.swapTotal + "G" + (root.ramInfo ? " · " + root.ramInfo : "")
           color: root.muted
           font.pixelSize: Style.font.bodySmall
@@ -547,7 +658,7 @@ Panel {
 
       Column {
         width: parent.width
-        visible: root.gpuName !== "GPU" || root.gpuLoad >= 0 || root.gpuTemp !== "--"
+        visible: root.gpuName !== "GPU" || root.gpuLoad >= 0 || root.gpuTemp !== "--" || root.gpuLoadReason !== ""
         spacing: Style.space(6)
         RowLayout {
           width: parent.width
@@ -569,6 +680,15 @@ Panel {
             font.pixelSize: Style.font.bodySmall
           }
         }
+        Text {
+          visible: root.gpuLoad < 0 && root.gpuLoadReason !== ""
+          width: parent.width
+          text: root.gpuLoadReason
+          textFormat: Text.PlainText
+          color: root.muted
+          font.pixelSize: Style.font.caption
+          elide: Text.ElideRight
+        }
         Rectangle {
           visible: root.gpuLoad >= 0
           width: parent.width
@@ -583,6 +703,22 @@ Panel {
             color: root.levelColor(root.gpuLoad, 70, 90)
           }
         }
+        Text {
+          visible: root.gpuPowerW >= 0 || root.gpuClients.length > 0
+          width: parent.width
+          text: (root.gpuPowerW >= 0 ? "pkg " + root.gpuPowerW.toFixed(1) + " W" : "")
+                + (root.gpuPowerW >= 0 && root.gpuClients.length > 0 ? " · " : "")
+                + (root.gpuClients.length > 0
+                   ? root.gpuClients.length + " gpu proc" + (root.gpuClients.length > 1 ? "s" : "")
+                     + ": " + root.gpuClients.slice(0, 4).map(function(c) { return c.name }).join(", ")
+                     + (root.gpuClients.length > 4 ? "…" : "")
+                   : "")
+          textFormat: Text.PlainText
+          color: root.muted
+          font.pixelSize: Style.font.bodySmall
+          elide: Text.ElideRight
+          wrapMode: Text.NoWrap
+        }
       }
 
       PanelSeparator {
@@ -595,6 +731,7 @@ Panel {
         visible: root.disks.length > 0
         spacing: Style.space(6)
         Text {
+          textFormat: Text.PlainText
           text: "Storage"
           color: root.fg
           font.bold: true
@@ -656,38 +793,47 @@ Panel {
         RowLayout {
           width: parent.width
           Text {
+            textFormat: Text.PlainText
             Layout.fillWidth: true
             text: "Fans " + root.fan1Rpm + " / " + root.fan2Rpm + " RPM"
             color: root.fg
             font.pixelSize: Style.font.bodySmall
           }
-          Rectangle {
-            id: daemonBtn
-            implicitWidth: daemonBtnText.implicitWidth + Style.space(16)
-            implicitHeight: Style.space(22)
-            radius: Style.space(4)
-            color: root.daemonRunning ? "transparent" : root.accent
-            border.color: root.daemonRunning ? root.fg : root.accent
-            border.width: 1
-            opacity: root.daemonRunning ? 0.7 : 1.0
-            Text {
-              id: daemonBtnText
-              anchors.centerIn: parent
-              text: root.daemonRunning ? "● Daemon Active" : "⚡ Start Daemon"
-              color: root.daemonRunning ? root.fg : Color.background
-              font.bold: true
-              font.pixelSize: Style.font.caption
-            }
-            MouseArea {
-              anchors.fill: parent
-              cursorShape: Qt.PointingHandCursor
-              onClicked: root.triggerDaemon()
-            }
+        }
+        Text {
+          width: parent.width
+          text: root.helperHint()
+          textFormat: Text.PlainText
+          wrapMode: Text.Wrap
+          color: root.fanControl ? root.muted : root.accent
+          font.pixelSize: Style.font.caption
+        }
+        Rectangle {
+          visible: !root.fanControl && root.helperState !== "missing"
+          width: parent.width
+          height: Style.space(34)
+          radius: Style.space(6)
+          color: "transparent"
+          border.color: root.fg
+          border.width: 1
+          Text {
+            anchors.centerIn: parent
+            text: "Reset to auto"
+            textFormat: Text.PlainText
+            color: root.fg
+            font.bold: true
+            font.pixelSize: Style.font.caption
+          }
+          MouseArea {
+            anchors.fill: parent
+            cursorShape: Qt.PointingHandCursor
+            onClicked: root.setMode("auto")
           }
         }
         Row {
           width: parent.width
           spacing: Style.space(6)
+          visible: root.fanControl
           Repeater {
             model: ["auto", "low", "med", "high", "custom"]
             delegate: Rectangle {
@@ -719,7 +865,7 @@ Panel {
         Row {
           width: parent.width
           spacing: Style.space(6)
-          visible: root.currentMode === "custom"
+          visible: root.fanControl && root.currentMode === "custom"
           Repeater {
             model: ["silent", "balanced", "performance"]
             delegate: Rectangle {
@@ -816,6 +962,7 @@ Panel {
         RowLayout {
           width: parent.width
           Text {
+            textFormat: Text.PlainText
             text: "TOP MEMORY  ·  j/k  x kill"
             color: root.muted
             font.pixelSize: Style.font.bodySmall
@@ -825,6 +972,7 @@ Panel {
             Layout.fillWidth: true
           }
           Text {
+            textFormat: Text.PlainText
             text: "b btop"
             color: root.muted
             font.pixelSize: Style.font.caption
@@ -858,6 +1006,7 @@ Panel {
                 elide: Text.ElideRight
               }
               Text {
+                textFormat: Text.PlainText
                 text: "PID " + (modelData.pid || "")
                 color: root.muted
                 font.pixelSize: Style.font.bodySmall
@@ -877,6 +1026,7 @@ Panel {
                 radius: 4
                 color: root.urgent
                 Text {
+                  textFormat: Text.PlainText
                   anchors.centerIn: parent
                   text: "x"
                   color: Color.background
