@@ -7,12 +7,14 @@ import json
 import os
 import re
 import selectors
+import shlex
 import shutil
 import signal
 import stat
 import subprocess
 import sys
 import time
+from collections import deque
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +24,227 @@ JOB_DEADLINE_S = 8
 MAX_OUT_BYTES = 262144
 MAX_STR = 96
 MAX_LIST = 64
+
+CONFIG_PATH = Path.home() / ".config" / "omarchy" / "resources.json"
+
+# Built-in comm -> display name map; ~/.config/omarchy/resources.json
+# "names" overrides or extends it. Keys are the 15-char comm.
+FRIENDLY_NAMES: dict[str, str] = {
+    "qemu-system-aar": "Windows VM",
+    "qemu-system-x86": "QEMU VM",
+    "wlfreerdp": "Windows RDP",
+    "wlfreerdp3": "Windows RDP",
+    "xfreerdp": "Windows RDP",
+    "xfreerdp3": "Windows RDP",
+    "remote-viewer": "VM Console",
+    "muvm": "Steam VM",
+    "libkrun": "Steam VM",
+    "chromium": "Chromium",
+    "chrome": "Chrome",
+    "cursor": "Cursor",
+    "devin": "Devin",
+    "quickshell": "Omarchy Shell",
+    "wispr-flow": "Wispr Flow",
+    "wispd": "Wisp",
+    "grok-bot": "Grok Bot",
+    "agy": "Antigravity",
+    "ollama": "Ollama",
+    "dockerd": "Docker",
+    "docker": "Docker",
+    "docker-compose": "Docker Compose",
+    "containerd": "containerd",
+    "tailscaled": "Tailscale",
+    "steam": "Steam",
+    "ghostty": "Ghostty",
+    "kitty": "Kitty",
+    "foot": "Foot",
+    "footclient": "Foot",
+    "code": "VS Code",
+    "obsidian": "Obsidian",
+    "Hermes": "Hermes",
+    "hermes": "Hermes",
+    "voxtype": "Voxtype",
+    "firefox": "Firefox",
+    "thunderbird": "Thunderbird",
+    "slack": "Slack",
+    "nautilus": "Files",
+    "spotifast": "Spotifast",
+    "easyeffects": "Easy Effects",
+    "solaar": "Solaar",
+    "Hyprland": "Hyprland",
+    "hyprland": "Hyprland",
+    "1password": "1Password",
+    "gh": "GitHub CLI",
+    "codex": "Codex",
+    "claude": "Claude",
+    "gemini": "Gemini",
+    "btop": "btop",
+    "python": "Python",
+    "python3": "Python",
+    "node": "Node.js",
+    "npm": "npm",
+    "java": "Java",
+    "postgres": "PostgreSQL",
+    "Xwayland": "Xwayland",
+    "pipewire": "PipeWire",
+    "wireplumber": "WirePlumber",
+    "blip-bridged": "Blip Bridge",
+    "llama-server": "llama.cpp",
+    "kworker": "kernel worker",
+    "systemd": "systemd",
+    "sshd": "SSH",
+}
+
+
+def _argv_flag_value(args: str, *flags: str) -> str:
+    """Value of `-f v` / `--flag v` / `--flag=v` inside a cmdline string."""
+    try:
+        toks = shlex.split(args)
+    except ValueError:
+        toks = args.split()
+    for i, tok in enumerate(toks):
+        for flag in flags:
+            if tok == flag:
+                return toks[i + 1] if i + 1 < len(toks) else ""
+            if tok.startswith(flag + "="):
+                return tok.split("=", 1)[1]
+    return ""
+
+
+# Trailing quantization tag on GGUF filenames: -q4_k_m, -IQ2_XXS, -f16, -bf16.
+_QUANT_SUFFIX = re.compile(r"[-_.](?:i?q\d[\w]*|f(?:16|32|p16)|bf16)$", re.I)
+
+
+def _llama_cpp_name(comm: str, exe: str, args: str) -> str:
+    """`llama.cpp {model basename} (:port)` derived from the server's argv."""
+    label = "llama.cpp"
+    model = _argv_flag_value(args, "-m", "--model")
+    if model:
+        base = os.path.basename(model)
+        base = re.sub(r"\.(?:gguf|bin)$", "", base, flags=re.I)
+        base = _QUANT_SUFFIX.sub("", base)
+        if base:
+            label += " " + _clip(base, 32)
+    port = _argv_flag_value(args, "--port")
+    if port.isdigit():
+        label += f" (:{port})"
+    return label
+
+
+# Data-driven naming rules, evaluated in order; first match wins.
+# Keys: "comm" exact match, "exe_contains"/"arg_contains" substring match —
+# all present keys must hold. "name" is a string or a
+# (comm, exe, args) -> str callable.
+NAMING_RULES: list[dict[str, Any]] = [
+    # Ollama's spawned runner vs. the user's own llama.cpp fleet (KTD1).
+    {"comm": "llama-server", "exe_contains": "ollama", "name": "Ollama Backend"},
+    {"comm": "llama-server", "arg_contains": "ollama", "name": "Ollama Backend"},
+    {"comm": "ollama_llama_se", "name": "Ollama Backend"},
+    {"comm": "llama-server", "exe_contains": "llama.cpp", "name": _llama_cpp_name},
+]
+
+
+def _rule_matches(match: dict[str, str], comm: str, exe: str, args: str) -> bool:
+    """All present match keys must hold: comm/exe equality-or-substring,
+    arg/exe_contains/arg_contains substrings."""
+    if "comm" in match and match["comm"] != comm:
+        return False
+    for key, haystack in (("exe", exe), ("exe_contains", exe),
+                          ("arg", args), ("arg_contains", args)):
+        if key in match and match[key] not in haystack:
+            return False
+    return True
+
+
+def _parse_user_rule(entry: Any) -> dict[str, Any] | None:
+    """Normalize one resources.json "rules" entry; None when malformed.
+
+    Shape: {"match": {"comm"|"exe"|"arg": str}, "name": str}. `comm` is an
+    exact match; `exe`/`arg` are substring contains (same as built-ins).
+    """
+    if not isinstance(entry, dict):
+        return None
+    match = entry.get("match")
+    name = entry.get("name")
+    if not isinstance(match, dict) or not isinstance(name, str) or not name.strip():
+        return None
+    cleaned: dict[str, str] = {}
+    for key in ("comm", "exe", "arg"):
+        val = match.get(key)
+        if val is None:
+            continue
+        if not isinstance(val, str) or not val:
+            return None
+        cleaned[key] = _clip(val, MAX_STR)
+    if not cleaned:
+        return None
+    return {"match": cleaned, "name": _clip(name.strip(), 48)}
+
+
+_proc_config_cache: dict[str, Any] | None = None
+
+
+def _proc_config() -> dict[str, Any]:
+    """User process-view config: names, rules, min_mem_mb, top, find_max."""
+    global _proc_config_cache
+    if _proc_config_cache is not None:
+        return _proc_config_cache
+    cfg: dict[str, Any] = {"names": {}, "rules": [], "min_mem_mb": MIN_MEM_MB, "top": 32, "find_max": 24}
+    try:
+        raw = CONFIG_PATH.read_bytes()
+        if len(raw) <= 256 * 1024:
+            data = json.loads(raw)
+            if isinstance(data, dict):
+                if isinstance(data.get("names"), dict):
+                    cfg["names"] = {
+                        _clip(str(k), 15): _clip(str(v), 48)
+                        for k, v in data["names"].items()
+                    }
+                if isinstance(data.get("rules"), list):
+                    for i, entry in enumerate(data["rules"][:MAX_LIST]):
+                        rule = _parse_user_rule(entry)
+                        if rule is None:
+                            print(
+                                f"resources.json: rule[{i}] malformed, skipped",
+                                file=sys.stderr,
+                            )
+                            continue
+                        cfg["rules"].append(rule)
+                elif "rules" in data:
+                    print("resources.json: 'rules' is not a list, ignored",
+                          file=sys.stderr)
+                for key, lo, hi in (("min_mem_mb", 1, 4096), ("top", 1, MAX_LIST), ("find_max", 1, MAX_LIST)):
+                    try:
+                        cfg[key] = max(lo, min(hi, int(data.get(key, cfg[key]))))
+                    except (TypeError, ValueError):
+                        pass
+    except (OSError, ValueError):
+        pass
+    _proc_config_cache = cfg
+    return cfg
+
+
+def display_name(comm: str, exe: str | None = None, args: str | None = None,
+                 cfg: dict[str, Any] | None = None) -> str:
+    """Human label for a process (KTD1): user rules -> user names map ->
+    built-in NAMING_RULES -> FRIENDLY_NAMES -> title-cased comm."""
+    cfg = _proc_config() if cfg is None else cfg
+    exe = exe or ""
+    args = args or ""
+    for rule in cfg.get("rules", []):
+        if _rule_matches(rule["match"], comm, exe, args):
+            return _clip(rule["name"], 48)
+    friendly = cfg.get("names", {}).get(comm)
+    if friendly is not None:
+        return friendly
+    for rule in NAMING_RULES:
+        if _rule_matches(rule, comm, exe, args):
+            name = rule["name"]
+            resolved = name(comm, exe, args) if callable(name) else name
+            return _clip(resolved or comm, 48) or comm
+    if comm in FRIENDLY_NAMES:
+        return FRIENDLY_NAMES[comm]
+    return comm.title() or comm
 
 # Fixed search path for external tools: a PATH-preceding shadow binary in the
 # caller's environment must never execute inside the long-lived shell process.
@@ -272,45 +495,141 @@ def _ps_rows(sort_key: str, fields: str) -> list[list[str]]:
     out = out.strip()
     rows: list[list[str]] = []
     for line in out.splitlines()[1:]:
-        parts = line.strip().split(None, 3)
+        # maxsplit = field count - 1, so a trailing "args" column keeps its
+        # spaces; numeric columns always land in fixed slots.
+        parts = line.strip().split(None, fields.count(","))
         if parts:
             rows.append(parts)
     return rows
 
 
 def top_cpu(n: int = 5) -> list[dict[str, Any]]:
+    cfg = _proc_config()
     procs: list[dict[str, Any]] = []
-    for parts in _ps_rows("%cpu", "pid,comm,%cpu")[:n]:
+    for parts in _ps_rows("%cpu", "pid,comm,%cpu,args")[:n]:
         if len(parts) < 3:
             continue
+        args = parts[3] if len(parts) > 3 else parts[1]
+        row = _proc_row(parts[0], parts[1], args, cfg)
+        if row is None:
+            continue
         try:
-            procs.append({
-                "pid": int(parts[0]),
-                "name": parts[1],
-                "cpu_pct": float(parts[2]),
-            })
+            row["cpu_pct"] = float(parts[2])
         except ValueError:
             continue
+        procs.append(row)
     return procs
 
 
+def _proc_identity(pid: int, args: str) -> tuple[str, str, str]:
+    """(exe_path, exe_basename, unit_leaf) — cheap per-row identity for the
+    hover tooltip and kill confirmation (KTD2). A readlink and a small cgroup
+    read per accepted row; no process spawn. Falls back to argv0 when
+    /proc/<pid>/exe is unreadable (other users' processes)."""
+    exe_path = ""
+    try:
+        exe_path = os.readlink(f"/proc/{pid}/exe")
+    except OSError:
+        pass
+    if not exe_path and args:
+        argv0 = args.split(None, 1)[0]
+        if not argv0.startswith("["):
+            exe_path = argv0
+    exe_base = os.path.basename(exe_path) if exe_path else ""
+    unit = ""
+    try:
+        with open(f"/proc/{pid}/cgroup", "rb") as fh:
+            lines = fh.read(4096).splitlines()
+        leaf = b""
+        for line in lines:
+            if line.startswith(b"0::"):
+                leaf = line
+                break
+        else:
+            leaf = lines[-1] if lines else b""
+        if leaf:
+            unit = leaf.rsplit(b"/", 1)[-1].decode(errors="replace")
+    except OSError:
+        pass
+    return _clip(exe_path, MAX_STR), _clip(exe_base, 32), _clip(unit, 64)
+
+
+def _proc_row(pid_s: str, comm: str, args: str,
+              cfg: dict[str, Any]) -> dict[str, Any] | None:
+    """Identity fields shared by top_mem and find rows; None on bad pid."""
+    try:
+        pid = int(pid_s)
+    except ValueError:
+        return None
+    exe_path, exe_base, unit = _proc_identity(pid, args)
+    return {
+        "pid": pid,
+        "name": comm,
+        "comm": comm,
+        "display": _clip(display_name(comm, exe_path, args, cfg), 48),
+        "exe": exe_base,
+        "exe_path": exe_path,
+        "args": _clip(args),
+        "unit": unit,
+    }
+
+
 def top_mem(n: int = 5, min_mb: int = MIN_MEM_MB) -> list[dict[str, Any]]:
+    cfg = _proc_config()
     procs: list[dict[str, Any]] = []
-    for parts in _ps_rows("rss", "pid,comm,rss,pmem"):
+    for parts in _ps_rows("rss", "pid,comm,rss,pmem,%cpu,args"):
         if len(procs) >= n:
             break
-        if len(parts) < 4:
+        if len(parts) < 5:
             continue
         try:
             rss_kb = int(parts[2])
             if rss_kb <= min_mb * 1024:
                 continue
-            procs.append({
-                "pid": int(parts[0]),
-                "name": parts[1],
-                "mem_mb": round(rss_kb / 1024, 1),
-                "mem_pct": float(parts[3]),
-            })
+            comm = parts[1]
+            args = parts[5] if len(parts) > 5 else comm
+            row = _proc_row(parts[0], comm, args, cfg)
+            if row is None:
+                continue
+            row["mem_mb"] = round(rss_kb / 1024, 1)
+            row["mem_pct"] = float(parts[3])
+            row["cpu_pct"] = float(parts[4])
+            procs.append(row)
+        except ValueError:
+            continue
+    return procs
+
+
+def find_procs(query: str, n: int = 24, min_mb: int = 1) -> list[dict[str, Any]]:
+    """Search every process by comm/cmdline substring; sorted by RSS.
+
+    Used by the panel's '/' find field, so matches are not limited to the
+    top-memory slice the idle panel shows.
+    """
+    cfg = _proc_config()
+    q = query.strip().lower()
+    if not q:
+        return []
+    procs: list[dict[str, Any]] = []
+    for parts in _ps_rows("rss", "pid,comm,rss,%cpu,args"):
+        if len(parts) < 5:
+            continue
+        try:
+            comm = parts[1]
+            cmdline = parts[4] if len(parts) > 4 else comm
+            if q not in comm.lower() and q not in cmdline.lower():
+                continue
+            rss_kb = int(parts[2])
+            if rss_kb <= min_mb * 1024:
+                continue
+            row = _proc_row(parts[0], comm, cmdline, cfg)
+            if row is None:
+                continue
+            row["mem_mb"] = round(rss_kb / 1024, 1)
+            row["cpu_pct"] = float(parts[3])
+            procs.append(row)
+            if len(procs) >= n:
+                break
         except ValueError:
             continue
     return procs
@@ -533,7 +852,21 @@ def gpu_clients() -> list[dict[str, Any]]:
                     comm = p.name
                 clients[pid] = comm
                 break
-    out = [{"pid": pid, "name": _clip(name, 32)} for pid, name in sorted(clients.items())]
+    cfg = _proc_config()
+    out = []
+    for pid, name in sorted(clients.items()):
+        try:
+            raw = (Path("/proc") / str(pid) / "cmdline").read_bytes()
+            args = raw.replace(b"\0", b" ").decode(errors="replace").strip()
+        except OSError:
+            args = ""
+        exe_path, _exe_base, unit = _proc_identity(pid, args)
+        out.append({
+            "pid": pid,
+            "name": _clip(name, 32),
+            "display": _clip(display_name(name, exe_path, args, cfg), 48),
+            "unit": unit,
+        })
     return out[:MAX_LIST]
 
 
@@ -741,6 +1074,197 @@ def disk_usage() -> list[dict[str, Any]]:
     return sorted(by_device.values(), key=lambda x: (x["mount"] != "/", x["mount"]))
 
 
+def _read_net_dev(path: Path | None = None) -> dict[str, tuple[int, int]]:
+    """{iface: (rx_bytes, tx_bytes)} from /proc/net/dev, loopback excluded."""
+    out: dict[str, tuple[int, int]] = {}
+    try:
+        lines = (path or Path("/proc/net/dev")).read_text().splitlines()
+    except OSError:
+        return out
+    for line in lines[2:]:
+        name, sep, rest = line.partition(":")
+        if not sep:
+            continue
+        fields = rest.split()
+        if len(fields) < 9:
+            continue
+        try:
+            rx, tx = int(fields[0]), int(fields[8])
+        except ValueError:
+            continue
+        name = name.strip()
+        if name and name != "lo":
+            out[name] = (rx, tx)
+    return out
+
+
+# Whole-disk names only; partitions and virtual devices (loop, dm, zram)
+# would double-count against the backing disk.
+_WHOLE_DISK = re.compile(
+    r"^(nvme\d+n\d+|mmcblk\d+|sd[a-z]+|vd[a-z]+|xvd[a-z]+|hd[a-z]+|md\d+)$")
+
+
+def _read_diskstats(path: Path | None = None) -> dict[str, tuple[int, int]]:
+    """{dev: (sectors_read, sectors_written)} for whole physical disks."""
+    out: dict[str, tuple[int, int]] = {}
+    try:
+        lines = (path or Path("/proc/diskstats")).read_text().splitlines()
+    except OSError:
+        return out
+    for line in lines:
+        f = line.split()
+        if len(f) < 10 or not _WHOLE_DISK.match(f[2]):
+            continue
+        try:
+            out[f[2]] = (int(f[5]), int(f[9]))
+        except ValueError:
+            continue
+    return out
+
+
+HISTORY_LEN = 60
+_MAX_RATE_DT = 300.0  # ignore prev samples older than this; counters reset
+_STATS_STATE: dict[str, Any] | None = None
+
+
+def _empty_stats_state() -> dict[str, Any]:
+    return {
+        "ts": 0.0,
+        "net": {},
+        "disk": {},
+        "hist": {k: deque(maxlen=HISTORY_LEN)
+                 for k in ("cpu_load", "cpu_temp", "mem_used")},
+    }
+
+
+def _stats_state_path() -> Path:
+    return _runtime_dir() / "stats_state.json"
+
+
+def _load_stats_state() -> dict[str, Any]:
+    """Prev counters + history rings persisted under the omarchy-fan runtime
+    dir. The panel re-execs this helper every refresh (KTD5's "long-lived
+    sampler" is really exec-per-sample), so prev state must live on disk."""
+    state = _empty_stats_state()
+    try:
+        fd = os.open(_stats_state_path(), os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError:
+        return state
+    try:
+        with os.fdopen(fd, "rb") as fh:
+            st = os.fstat(fh.fileno())
+            if (not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid()
+                    or st.st_size > 65536):
+                return state
+            data = json.loads(fh.read(65537))
+    except (OSError, ValueError):
+        return state
+    if not isinstance(data, dict):
+        return state
+    if isinstance(data.get("ts"), (int, float)):
+        state["ts"] = float(data["ts"])
+    if isinstance(data.get("net"), dict):
+        for k, v in list(data["net"].items())[:MAX_LIST]:
+            if (isinstance(v, list) and len(v) == 2
+                    and all(isinstance(x, (int, float)) and x >= 0 for x in v)):
+                state["net"][_clip(str(k), 32)] = (int(v[0]), int(v[1]))
+    if isinstance(data.get("disk"), dict):
+        for k, v in list(data["disk"].items())[:MAX_LIST]:
+            if (isinstance(v, list) and len(v) == 2
+                    and all(isinstance(x, (int, float)) and x >= 0 for x in v)):
+                state["disk"][_clip(str(k), 32)] = (int(v[0]), int(v[1]))
+    if isinstance(data.get("hist"), dict):
+        for key, ring in state["hist"].items():
+            vals = data["hist"].get(key)
+            if isinstance(vals, list):
+                for x in vals[-HISTORY_LEN:]:
+                    if isinstance(x, (int, float)) and not isinstance(x, bool):
+                        ring.append(int(x))
+    return state
+
+
+def _stats_state() -> dict[str, Any]:
+    global _STATS_STATE
+    if _STATS_STATE is None:
+        _STATS_STATE = _load_stats_state()
+    return _STATS_STATE
+
+
+def _save_stats_state(state: dict[str, Any]) -> None:
+    """Best-effort persist; failures just mean no rates/history next run."""
+    try:
+        rdir = _runtime_dir()
+        rdir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        payload = {
+            "ts": state["ts"],
+            "net": {k: list(v) for k, v in list(state["net"].items())[:MAX_LIST]},
+            "disk": {k: list(v) for k, v in list(state["disk"].items())[:MAX_LIST]},
+            "hist": {k: list(d) for k, d in state["hist"].items()},
+        }
+        raw = json.dumps(payload)[:MAX_OUT_BYTES]
+        fd = os.open(_stats_state_path(),
+                     os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, "w") as fh:
+            fh.write(raw)
+    except (OSError, ValueError):
+        pass
+
+
+def _rate_deltas(state: dict[str, Any], now: float,
+                 net_now: dict[str, tuple[int, int]],
+                 disk_now: dict[str, tuple[int, int]],
+                 ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """Byte/sec rates vs the previous persisted sample (KTD5). Counters that
+    shrank (reboot, iface replug) contribute nothing; stale prev (>5 min)
+    rebases instead of reporting a huge bogus rate. Per-interface and
+    per-device breakdowns ride alongside the aggregates for the card
+    drill-downs."""
+    prev_ts = state.get("ts") or 0.0
+    dt = now - prev_ts
+    if not (0 < dt <= _MAX_RATE_DT):
+        return None, None
+    net = None
+    prev_net = state.get("net") or {}
+    if net_now and prev_net:
+        down = up = 0
+        ifaces = []
+        for name, (rx, tx) in net_now.items():
+            prev = prev_net.get(name)
+            if prev and rx >= prev[0] and tx >= prev[1]:
+                down += rx - prev[0]
+                up += tx - prev[1]
+                d_bps = int((rx - prev[0]) / dt)
+                u_bps = int((tx - prev[1]) / dt)
+                if d_bps > 0 or u_bps > 0:
+                    ifaces.append({"name": _clip(name, 32),
+                                   "down_bps": d_bps, "up_bps": u_bps})
+        # Busy links first; idle tunnels/veth pairs just add scroll.
+        ifaces.sort(key=lambda i: i["down_bps"] + i["up_bps"], reverse=True)
+        net = {"down_bps": int(down / dt), "up_bps": int(up / dt),
+               "ifaces": ifaces[:MAX_LIST]}
+    disk = None
+    prev_disk = state.get("disk")
+    if disk_now and isinstance(prev_disk, dict) and prev_disk:
+        dr = dw = 0
+        devs = []
+        for name, (r, w) in disk_now.items():
+            prev = prev_disk.get(name)
+            if prev and r >= prev[0] and w >= prev[1]:
+                dr += r - prev[0]
+                dw += w - prev[1]
+                r_bps = int((r - prev[0]) * 512 / dt)
+                w_bps = int((w - prev[1]) * 512 / dt)
+                if r_bps > 0 or w_bps > 0:
+                    devs.append({"name": _clip(name, 32),
+                                 "read_bps": r_bps, "write_bps": w_bps})
+        devs.sort(key=lambda i: i["read_bps"] + i["write_bps"], reverse=True)
+        if dr >= 0 and dw >= 0:
+            disk = {"read_bps": int(dr * 512 / dt),
+                    "write_bps": int(dw * 512 / dt),
+                    "devs": devs[:MAX_LIST]}
+    return net, disk
+
+
 def _runtime_dir() -> Path:
     base = os.environ.get("XDG_RUNTIME_DIR") or os.path.join(
         os.path.expanduser("~"), ".local", "run"
@@ -835,8 +1359,28 @@ def collect(sample_seconds: float = SAMPLE_SECONDS) -> dict[str, Any]:
 
     cpu_load, cpu_cores = _read_cpu_stats(sample_seconds=sample_seconds)
 
+    # Cross-exec sampler state: net/disk rates are deltas vs the previous
+    # persisted sample; the bounded rings feed panel sparklines (KTD5).
+    state = _stats_state()
+    now = time.time()
+    net_now = _read_net_dev()
+    disk_now = _read_diskstats()
+    net_rates, disk_rates = _rate_deltas(state, now, net_now, disk_now)
+    hist = state["hist"]
+    hist["cpu_load"].append(int(cpu_load))
+    temp_m = re.match(r"-?\d+", cpu_temp or "")
+    if temp_m:
+        hist["cpu_temp"].append(int(temp_m.group(0)))
+    hist["mem_used"].append(int(round(mem["used"] / (1024 ** 2))))
+    state["ts"] = now
+    if net_now:
+        state["net"] = net_now
+    if disk_now:
+        state["disk"] = disk_now
+    _save_stats_state(state)
+
     # If nvidia gave a temp, prefer it for the GPU temp field; otherwise use the one we had
-    return {
+    payload = {
         "ok": True,
         "cpu_name": _clip(cpu_name()),
         "cpu_load": cpu_load,
@@ -864,9 +1408,20 @@ def collect(sample_seconds: float = SAMPLE_SECONDS) -> dict[str, Any]:
         "fan_curve": read_fan_curve(),
         "fan_control": fan_control_available(devices),
         "daemon_running": is_daemon_running(),
-        "top_mem": top_mem()[:MAX_LIST],
+        "top_mem": top_mem(n=_proc_config()["top"], min_mb=_proc_config()["min_mem_mb"])[:MAX_LIST],
         "top_cpu": top_cpu()[:MAX_LIST],
     }
+    # Additive keys (KTD6): absent on first sample or when a source is
+    # missing — the panel renders "--" for whatever is not there.
+    if net_rates is not None:
+        payload["net"] = net_rates
+    if disk_rates is not None:
+        payload["disk"] = disk_rates
+    if len(hist["cpu_load"]) >= 2:
+        payload["history"] = {
+            k: list(ring)[:MAX_LIST] for k, ring in hist.items()
+        }
+    return payload
 
 
 def is_daemon_running() -> bool:
@@ -887,7 +1442,13 @@ def main() -> int:
     # Hard wall-clock deadline: never let a stuck sensor or tool pin the job.
     signal.signal(signal.SIGALRM, lambda *_: os._exit(124))
     signal.alarm(JOB_DEADLINE_S)
-    out = json.dumps(collect())
+    # "--find <substr>": process-search mode used by the panel's '/' field.
+    if len(sys.argv) >= 3 and sys.argv[1] == "--find":
+        query = sys.argv[2]
+        procs = find_procs(query, n=_proc_config()["find_max"])[:MAX_LIST]
+        out = json.dumps({"ok": True, "procs": procs})
+    else:
+        out = json.dumps(collect())
     sys.stdout.write(out[:MAX_OUT_BYTES] + "\n")
     return 0
 

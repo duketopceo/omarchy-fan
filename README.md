@@ -96,6 +96,37 @@ automatically — the probe is already in place.
 
 The custom curve is editable from the panel when the helper is installed.
 
+## Process list configuration
+
+`~/.config/omarchy/resources.json` tunes the process list (all keys
+optional):
+
+```json
+{
+  "names": {"qemu-system-aar": "Windows 11 VM"},
+  "rules": [
+    {"match": {"exe": "ollama"}, "name": "Ollama Backend"},
+    {"match": {"comm": "my-daemon", "arg": "--serve"}, "name": "My Daemon"}
+  ],
+  "min_mem_mb": 15,
+  "top": 20,
+  "find_max": 24
+}
+```
+
+- `names` — `comm → label` overrides, applied to built-in names (kept for
+  backward compatibility).
+- `rules` — first-match-wins list evaluated before built-in naming.
+  `match` takes one or more of `comm` (exact), `exe` (substring of the exe
+  path), `arg` (substring of the cmdline); all present keys must hold.
+  Malformed entries are skipped with a warning, never fatal.
+- `min_mem_mb`, `top`, `find_max` — list sizing as before.
+
+Built-in naming already disambiguates the common look-alikes: Ollama's
+spawned `llama-server` shows as "Ollama Backend", while `llama.cpp` builds
+under a `llama.cpp` path show as `llama.cpp {model} (:port)` derived from
+their own `-m`/`--port` flags.
+
 ## Requirements
 
 - `python3` (all helpers are Python; the panel execs `/usr/bin/python3`)
