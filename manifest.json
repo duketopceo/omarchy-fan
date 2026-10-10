@@ -2,11 +2,13 @@
   "schemaVersion": 1,
   "id": "lukedaduke.fan",
   "name": "Resource & Fan",
-  "version": "2.5.0",
+  "version": "2.5.1",
   "author": "lukedaduke",
   "license": "MIT",
   "description": "RAM, CPU/GPU/NVMe thermals, top processes, and fan presets in the Omarchy bar.",
-  "kinds": ["bar-widget"],
+  "kinds": [
+    "bar-widget"
+  ],
   "activation": "on-demand",
   "entryPoints": {
     "barWidget": "Panel.qml"

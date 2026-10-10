@@ -897,7 +897,7 @@ Panel {
     id: button
     anchors.fill: parent
     bar: root.bar
-    text: "󰍛 " + root.memUsed + "G " + root.memPct + "% " + root.cpuTemp + " 󰈐 " + (root.currentMode === "auto" ? "A" : (root.currentMode === "high" ? "H" : (root.currentMode === "med" ? "M" : (root.currentMode === "custom" ? "C" : "L"))))
+    text: "󰍛 " + root.memUsed + "G " + root.cpuTemp
     fontSize: Style.font.bodySmall
     active: root.memPct >= 80 || root.currentMode === "high" || (root.currentMode === "auto" && parseInt(root.cpuTemp) >= 60)
     activeColor: root.memPct >= 85 || parseInt(root.cpuTemp) >= 65 ? root.urgent : (root.bar ? root.bar.barForeground : Color.foreground)
